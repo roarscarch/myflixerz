@@ -92,26 +92,60 @@ class FlixHQ extends MovieParser {
       movieInfo.description = $('.description').text().trim();
       movieInfo.type = mediaId.includes('/movie/') ? TvType.MOVIE : TvType.TVSERIES;
 
-      const metaData = {};
+      // Extract duration from the button
+      const durationText = $('.btn-quality').next('.btn-sm:contains("min")').text().trim();
+      if (durationText) {
+        movieInfo.duration = durationText;
+      } else {
+        // Alternative selector
+        movieInfo.duration = $('.row-line:contains("Duration")').text().replace('Duration:', '').trim();
+      }
+
+      // Extract IMDB rating
+      const imdbText = $('.btn-imdb').text().trim();
+      if (imdbText) {
+        const ratingMatch = imdbText.match(/IMDB: (\d+\.\d+)/);
+        movieInfo.rating = ratingMatch ? parseFloat(ratingMatch[1]) : 0;
+      }
+
+      // Extract release date, genre, casts, production, country
       $('.elements .row-line').each((i, el) => {
-        const label = $(el).find('.type').text().trim().toLowerCase();
-        const value = $(el).find('.value').text().trim();
-        metaData[label] = value;
+        const typeText = $(el).find('.type strong').text().trim().toLowerCase();
+        
+        if (typeText.includes('released')) {
+          movieInfo.releaseDate = $(el).text().replace(/Released:|\s+/g, ' ').trim();
+        } 
+        else if (typeText.includes('genre')) {
+          movieInfo.genres = $(el).find('a')
+            .map((i, genreEl) => $(genreEl).text().trim())
+            .get()
+            .filter(Boolean);
+        } 
+        else if (typeText.includes('cast')) {
+          movieInfo.casts = $(el).find('a')
+            .map((i, castEl) => $(castEl).text().trim())
+            .get()
+            .filter(Boolean);
+        }
+        else if (typeText.includes('production')) {
+          movieInfo.production = $(el).find('a')
+            .map((i, prodEl) => $(prodEl).text().trim())
+            .get()
+            .filter(Boolean)
+            .join('');
+        }
+        else if (typeText.includes('country')) {
+          movieInfo.country = $(el).find('a')
+            .map((i, countryEl) => $(countryEl).text().trim())
+            .get()
+            .filter(Boolean)
+            .join('');
+        }
+        else if (typeText.includes('duration')) {
+          movieInfo.duration = $(el).text().replace('Duration:', '').trim();
+        }
       });
 
-      movieInfo.releaseDate = metaData['released:'] || metaData['release:'] || '';
-      movieInfo.genres = $('.row-line:contains("Genre") a')
-        .map((i, el) => $(el).text().trim())
-        .get()
-        .filter(Boolean);
-      movieInfo.casts = $('.row-line:contains("Cast") a')
-        .map((i, el) => $(el).text().trim())
-        .get()
-        .filter(Boolean);
-      movieInfo.production = $('.row-line:contains("Production") a').text().trim();
-      movieInfo.country = $('.row-line:contains("Country") a').text().trim();
-      movieInfo.duration = $('.elements .row-line:contains("Duration") .value').text().trim();
-      movieInfo.rating = parseFloat($('.elements .row-line:contains("IMDb") .value').text().trim()) || 0;
       movieInfo.recommendations = recommendationsArray;
 
       if (movieInfo.type === TvType.TVSERIES) {
