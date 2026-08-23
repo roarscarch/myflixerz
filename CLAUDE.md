@@ -70,8 +70,15 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
   decoders with self-generated fixtures. Keep it green; extend it when the
   cipher or a response shape changes.
 - `/health` must stay defined BEFORE the limiter (probes must not count).
+- `/download`: direct sources proxy with `Content-Disposition: attachment`;
+  `hls=1` spawns ffmpeg (`-c:v copy -c:a aac -movflags frag_keyframe+empty_moov`
+  — **no `faststart`**: the output is a pipe, not seekable). Client abort must
+  kill the ffmpeg child (orphaned ffmpeg = disk/CPU leak). Without ffmpeg the
+  HLS path 503s with a hint — that is intended behavior, not a bug. Both
+  `/play` and `/download` are exempt from the rate limiter.
 - The service worker (`public/sw.js`) must NEVER cache `/play` or API paths
   (tokenized URLs, Range requests) — `NETWORK_ONLY` regex guards that.
+- PWA paths: the `NETWORK_ONLY` regex also covers `/download` — same reason.
 - Peachify CDN flakiness (502s) is upstream; Auto mode + vidnest fallback is
   the mitigation, not new code.
 - Server log: `/tmp/flixhq_server.log` when started with nohup.

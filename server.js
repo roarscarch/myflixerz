@@ -3,6 +3,7 @@ const path = require('path');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { Readable } = require('stream');
+const { spawn } = require('child_process');
 const FlixHQ = require('./flixhq');
 
 const app = express();
@@ -10,10 +11,12 @@ const flixhq = new FlixHQ();
 
 // Rate limiting — API metadata calls only. Static files and /play (which
 // streams HLS segments — hundreds per movie) must never count against it.
+// /download also streams for minutes at a time; one download must not burn
+// the API quota.
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 600,
-  skip: (req) => req.path.startsWith('/play'),
+  skip: (req) => req.path.startsWith('/play') || req.path.startsWith('/download'),
 });
 
 app.use(cors());
@@ -377,6 +380,92 @@ app.get('/play', async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: `Proxy error: ${e.message}` });
   }
+});
+
+// Download endpoint — saves the current stream to disk.
+//  - direct sources (mp4/webm/…): streamed through with Content-Disposition
+//  - HLS (hls=1): remuxed by ffmpeg into a playable .mp4 — video copied
+//    (no re-encode), audio re-encoded to AAC for container compatibility,
+//    fragmented moov so a partial file is still playable
+// ffmpeg must be on PATH; without it HLS downloads 503 with a hint.
+app.get('/download', (req, res) => {
+  const { url, ref, title, hls } = req.query;
+  if (!url) return res.status(400).json({ error: 'url query parameter is required' });
+  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Invalid url' });
+  const referer = ref || 'https://peachify.top/';
+  const ext = hls === '1' ? 'mp4' : (path.extname(new URL(url).pathname).replace(/[^a-z0-9]/gi, '') || 'mp4');
+  const base = String(title || 'myflixerz-download')
+    .replace(/[^\w\- ]+/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 80) || 'myflixerz-download';
+  res.set({
+    'Content-Disposition': `attachment; filename="${base}.${ext}"`,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  if (hls === '1') {
+    const ff = spawn(
+      'ffmpeg',
+      [
+        '-hide_banner', '-loglevel', 'error',
+        '-headers', `Referer: ${referer}\r\nUser-Agent: ${STREAM_UA}\r\n`,
+        '-i', url,
+        '-c:v', 'copy', '-c:a', 'aac',
+        '-movflags', 'frag_keyframe+empty_moov',
+        '-f', 'mp4', 'pipe:1',
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    let stderr = '';
+    let aborted = false;
+    ff.stderr.on('data', (d) => (stderr = (stderr + d).slice(-2048)));
+    ff.stdout.on('error', () => {});
+    ff.on('error', (e) => {
+      // ENOENT = ffmpeg not installed
+      if (res.headersSent) return;
+      res.status(e.code === 'ENOENT' ? 503 : 502).json({
+        error:
+          e.code === 'ENOENT'
+            ? 'ffmpeg is not installed on this server — HLS downloads need it (sudo apt install ffmpeg)'
+            : `ffmpeg failed to start: ${e.message}`,
+      });
+    });
+    ff.on('close', (code) => {
+      if (aborted) return;
+      if (res.headersSent) return res.end();
+      res.status(502).json({ error: `ffmpeg exited before producing output (code ${code}): ${stderr.slice(-400)}` });
+    });
+    res.on('close', () => {
+      aborted = true;
+      if (!ff.killed) ff.kill();
+    });
+    res.set('Content-Type', 'video/mp4');
+    ff.stdout.pipe(res);
+    return;
+  }
+
+  // direct source: stream through like /play, flagged as a download
+  fetch(url, { headers: { Referer: referer, 'User-Agent': STREAM_UA } })
+    .then((up) => {
+      if (!up.ok && up.status !== 206) return res.status(up.status).json({ error: `Upstream ${up.status}` });
+      res.set('Content-Type', up.headers.get('content-type') || 'application/octet-stream');
+      const cl = up.headers.get('content-length');
+      if (cl) res.set('Content-Length', cl);
+      return new Promise((resolve, reject) => {
+        const body = Readable.fromWeb(up.body);
+        body.on('error', (e) => {
+          res.destroy();
+          reject(e);
+        });
+        res.on('close', resolve);
+        body.pipe(res);
+      });
+    })
+    .catch((e) => {
+      if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${e.message}` });
+    });
 });
 
 // SPA fallback: unknown GETs serve the frontend

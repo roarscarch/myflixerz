@@ -546,6 +546,7 @@
           </select>
           <button class="subs-select ctl-btn" id="speedBtn" title="Playback speed (shortcuts: > / <)">Speed: 1x</button>
           <button class="subs-select ctl-btn" id="pipBtn" title="Picture in picture">⧉ PiP</button>
+          <button class="subs-select ctl-btn" id="downloadBtn" title="Download this video">↓ Download</button>
           <span class="sub" id="providerInfo"></span>
         </div>
       </div>`;
@@ -574,9 +575,10 @@
     const player = new Player.MoviePlayer(shell);
     const subsSelect = view.querySelector('#subsSelect');
 
-    // toolbar: speed + PiP + resume notice
+    // toolbar: speed + PiP + download + resume notice
     const speedBtn = view.querySelector('#speedBtn');
     const pipBtn = view.querySelector('#pipBtn');
+    const downloadBtn = view.querySelector('#downloadBtn');
     if (!document.pictureInPictureEnabled || !document.createElement('video').requestPictureInPicture) {
       pipBtn.hidden = true;
     }
@@ -586,6 +588,17 @@
     });
     speedBtn.addEventListener('click', () => player.changeSpeed(0.25));
     pipBtn.addEventListener('click', () => player.togglePip());
+    downloadBtn.addEventListener('click', () => {
+      const href = player.downloadUrl();
+      if (!href) return toastMsg('No stream loaded yet.');
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = ''; // same-origin → filename comes from Content-Disposition
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      toastMsg('Download started — check your Downloads folder.');
+    });
     shell.addEventListener('progress-resumed', (e) => toastMsg(`Resumed from ${fmtTime(e.detail.pos)}`));
     shell.addEventListener('sources-ready', (e) => {
       const labels = Player.PROVIDER_LABELS;

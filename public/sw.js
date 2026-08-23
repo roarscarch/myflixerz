@@ -9,7 +9,7 @@ const CACHE = 'myflixerz-v1';
 const SHELL = ['/', '/css/style.css', '/js/api.js', '/js/player.js', '/js/app.js', '/manifest.webmanifest', '/icons/icon.svg'];
 
 // everything the app fetches from our own API — network only
-const NETWORK_ONLY = /^\/(?:play|sources|servers|dubs|search|info|recent|trending|movies|tv|genre|top-imdb|health|movie\/embed|tv\/embed)(?:\/|\?|$)/;
+const NETWORK_ONLY = /^\/(?:play|download|sources|servers|dubs|search|info|recent|trending|movies|tv|genre|top-imdb|health|movie\/embed|tv\/embed)(?:\/|\?|$)/;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

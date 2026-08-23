@@ -153,6 +153,10 @@ npm start        # or: node server.js
 Optional env: `TMDB_API_KEY` (defaults to the public key embedded in
 `flixhq.js`), `PORT` (default 3000).
 
+Requires **ffmpeg on PATH** for HLS downloads (the Download button remuxes
+HLS → mp4). Direct `.mp4` sources download without it. Ubuntu:
+`sudo apt install -y ffmpeg` (the Docker image already ships it).
+
 ---
 
 ## 5. API reference
@@ -175,12 +179,14 @@ All routes serve JSON. `episodeId` = `{season}-{episode}` for TV
 | `GET /movie/embed/:movieId` | `server?` | every server's raw source URL + `isM3U8` |
 | `GET /tv/embed/:episodeId` | `server?` | same for TV (`episodeId` = `tvId:s-e`) |
 | `GET /play` | `url`, `ref?` | **stream pass-through proxy** (not JSON) |
+| `GET /download` | `url`, `ref?`, `title?`, `hls?` | **save the stream** (not JSON). `hls=1` remuxes via ffmpeg → `.mp4`; otherwise streams through with `Content-Disposition: attachment` |
 | `GET /health` | — | `{ok, uptime}` for container orchestration (before the limiter) |
 | `GET /` (fallback) | — | `public/index.html` |
 
-Rate limit: **600 requests / 15 min** on API routes. `/play` is always exempt
-(it can be called hundreds of times per movie). Static files are served before
-the limiter and never count.
+Rate limit: **600 requests / 15 min** on API routes. `/play` and `/download`
+are always exempt (`/play` can be called hundreds of times per movie; one
+download can stream for an hour). Static files are served before the limiter
+and never count.
 
 ---
 
@@ -321,6 +327,7 @@ new hosts default to the proxy, which is the safe choice.
 | Resume + Continue Watching | Position saved to **`myflixerz-progress`** (per `mediaId/episodeId`, throttled to 5s, removed when the title ends). On reload the player seeks back automatically ("Resumed from 1:30" toast); the home page shows a "⏯️ Continue Watching" row with per-title progress bars, jumping straight into the right episode. |
 | Keyboard shortcuts | `space`/`k` play-pause · `→`/`l` +10s · `←`/`j` −10s · `↑`/`↓` volume · `m` mute · `f` fullscreen · `>`/`.` speed up · `<`/`,` speed down (ignored while typing). |
 | Speed + PiP | Toolbar buttons: speed cycles 0.25× increments (clamped 0.25–2×), PiP button hidden when unsupported. |
+| Download | Toolbar button saves whatever is currently playing. Direct sources stream through `/download` with an `attachment` header; HLS gets remuxed to `.mp4` by server-side ffmpeg (`-c:v copy`, no re-encode). Filename comes from the title. Requires ffmpeg on PATH for HLS. |
 | Skip intro | `api.theintrodb.org` lookup. |
 
 ### PWA

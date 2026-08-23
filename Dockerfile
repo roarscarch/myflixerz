@@ -2,6 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# ffmpeg remuxes HLS streams for /download (direct mp4 sources don't need it)
+RUN apk add --no-cache ffmpeg
+
 # install deps first (better layer caching)
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev

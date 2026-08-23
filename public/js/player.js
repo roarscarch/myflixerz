@@ -210,6 +210,7 @@ const Player = (() => {
     }
 
     _attach(src) {
+      this._currentSource = src;
       const url = playableUrl(src.url, src.referer);
       this.hideLoading();
 
@@ -332,6 +333,16 @@ const Player = (() => {
       const rate = Math.round((this.video.playbackRate + delta) * 100) / 100;
       this.video.playbackRate = Math.min(2, Math.max(0.25, rate));
       this.shell.dispatchEvent(new CustomEvent('speed-change', { detail: { rate: this.video.playbackRate } }));
+    }
+
+    /** /download URL for the currently attached source ('' if none loaded). */
+    downloadUrl() {
+      const src = this._currentSource;
+      if (!src) return '';
+      const p = new URLSearchParams({ url: src.url, title: this._title || 'myflixerz-download' });
+      if (src.referer) p.set('ref', src.referer);
+      if (src.isM3U8) p.set('hls', '1');
+      return `/download?${p.toString()}`;
     }
 
     _emitQuality(levels) {
