@@ -1,231 +1,421 @@
-# MyFlixHQ API
+# MyFlixz
 
-A Node.js API for scraping and serving movie/TV show data from MyFlixerz.to. This API provides various endpoints to fetch movies, TV shows, search content, and get streaming sources.
+Self-hosted streaming frontend. The browser never touches the internet: every
+embed API call, decrypt, and stream fetch happens server-side, and the frontend
+talks only to our own Express server on `localhost`.
 
-## Features
+Playback is sourced from **two embed families** — Peachify (5 internal
+providers) and Vidnest (5 providers) — plus TMDB for all metadata and two
+independent subtitle APIs. Each embed API returns **encrypted JSON** that we
+decrypt in `extractor.js`; there is no scraping and no browser automation in the
+runtime app (Playwright is a dev-only dependency used for smoke tests in `/tmp`).
 
-- Search movies and TV shows
-- Fetch movie/TV show details
-- Get streaming sources and embed links
-- Browse recent and trending content
-- Paginated movie and TV show listings
-- Genre-based browsing
-- Top IMDB ratings
-- Rate limiting protection
-- CORS enabled
-- Ready for Vercel deployment
+```
+Browser ──(localhost only)──▶ Express server ──▶ Peachify / Vidnest / TMDB / subtitle APIs
+                                     │
+                                     └──▶ /play proxy ──▶ stream CDNs (Referer-gated)
+```
 
-## Installation
+---
+
+## 1. Architecture
+
+```mermaid
+flowchart LR
+    subgraph Browser["Browser (public/)"]
+        app["app.js<br/>hash router + views"]
+        player["player.js<br/>MoviePlayer (hls.js)"]
+        api["api.js<br/>API client"]
+    end
+
+    subgraph Server["Express (server.js)"]
+        limiter["rate limit 600 / 15 min<br/>(skips /play)"]
+        routes["API routes"]
+        proxy["/play stream proxy<br/>Referer + Range passthrough<br/>m3u8 URL rewriting"]
+    end
+
+    subgraph Biz["Business layer (flixhq.js)"]
+        tmdb["TMDB listing / info methods"]
+        sources["fetchEpisodeSources"]
+        dubs["fetchDubs<br/>(audio languages)"]
+    end
+
+    subgraph Resolvers["Embed resolvers (extractor.js)"]
+        peachify["Peachify resolver<br/>AES-256-GCM decrypt"]
+        vidnest["Vidnest resolver<br/>custom-base64 decrypt"]
+        ps{" "}
+    end
+
+    subgraph Upstream["Upstream APIs"]
+        peach_api["x.eat-peach.sbs<br/>{hr|air|holly|multi|moviebox}"]
+        vn_api["new.vidnest.fun<br/>{videasy|hollymoviehd|rogflix|buzz|ngc}"]
+        vdrk["sub.vdrk.site<br/>+ cache.vdrk.site"]
+        tmdb_api["api.themoviedb.org"]
+    end
+
+    subgraph CDNs["Stream CDNs"]
+        direct["CORS-open (direct play)<br/>eat-peach.sbs · 97bf1.com<br/>cache.vdrk.site"]
+        gated["Referer-gated (via /play)<br/>tiktoks.animanga.fun · akcloud · goodstream<br/>hlmv.tripplestream.online<br/>slast430did.com · azionedge"]
+    end
+
+    app --> api
+    api --> routes
+    player --> proxy
+    player --> direct
+    routes --> tmdb
+    routes --> sources
+    routes --> dubs
+    sources --> peachify
+    sources --> vidnest
+    sources --> ps
+    dubs --> peachify
+    peachify --> peach_api
+    vidnest --> vn_api
+    peachify --> direct
+    vidnest --> gated
+    gated --> proxy
+    tmdb --> tmdb_api
+    ps --> vdrk
+```
+
+## 2. One playback request, end to end
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant B as Browser (player.js)
+    participant S as Express (server.js)
+    participant F as FlixHQ (flixhq.js)
+    participant X as extractor.js
+    participant P as x.eat-peach.sbs
+    participant V as new.vidnest.fun
+    participant R as vdrk subs
+    participant C as Stream CDN
+
+    U->>B: click Play (or server button)
+    B->>S: GET /sources/{episodeId}?mediaId=movie/603&server=<name|null>
+    S->>F: fetchEpisodeSources(episodeId, mediaId, server)
+    F->>X: resolveStream({type, id, season, episode, server})
+    Note over X,P: server given → that family only;<br/>auto → peachify cycle (hr→air→holly→multi→moviebox)<br/>then vidnest cycle as fallback
+    X->>P: GET /{provider}/{type}/{id}[/{s}/{e}]
+    P-->>X: {"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}
+    X->>X: AES-256-GCM decrypt (key in extractor.js)
+    Note over X,V: if peachify yielded nothing: vidnest path
+    X->>V: GET /{provider}/{type}/{id}[/{s}/{e}]
+    V-->>X: {"encrypted":true,"data":"<custom-base64>"}
+    X->>X: custom-base64 decode → one of 3 shapes
+    F->>X: fetchSubtitles() + fetchVidnestSubtitles() (parallel)
+    X-->>F: [{label, file}] (deduped by label)
+    F-->>S: {sources, subtitles, provider}
+    S-->>B: JSON
+    B->>B: pick source honoring stored audio + quality
+    alt CDN is CORS-open (eat-peach/97bf1/cache)
+        B->>C: fetch HLS directly (hls.js)
+    else Referer-gated CDN (tiktoks/akcloud/...)
+        B->>S: GET /play?url=<encoded>&ref=<referer>
+        S->>C: fetch with Referer: <embed site> + Range + Chrome UA
+        C-->>S: playlist / segments
+        S-->>B: CORS * ; playlist URLs rewritten to /play
+        B->>S: GET /play?url=...&ref=... (each segment)
+        S-->>B: 206 bytes
+    end
+    B->>B: hls.js plays; quality/audio dropdowns live-update
+```
+
+---
+
+## 3. Project layout
+
+| File | Role |
+|---|---|
+| `server.js` | Express: static, rate limiter, all API routes, `/play` proxy, SPA fallback |
+| `flixhq.js` | `FlixHQ` class: TMDB metadata + listings, `fetchEpisodeSources`, `fetchDubs`, embeds |
+| `extractor.js` | **The crack layer**: Peachify + Vidnest decoders, subtitle fetchers, `resolveStream` dispatch, caching |
+| `models.js` | `TvType` enum |
+| `public/index.html` | SPA shell |
+| `public/css/` | Styles |
+| `public/js/app.js` | Hash router + all views (home, detail, watch, browse, search) |
+| `public/js/player.js` | `MoviePlayer` — hls.js wrapper, server fallback, quality/audio/subs |
+| `public/js/api.js` | Tiny `fetch` client for our own API |
+| `vercel.json` | Deploy config (`@vercel/node`, `server.js` as the single function) |
+
+---
+
+## 4. Running locally
 
 ```bash
+cd myflixerz
 npm install
+npm start        # or: node server.js
+# → http://localhost:3000
 ```
 
-## Local Development
+Optional env: `TMDB_API_KEY` (defaults to the public key embedded in
+`flixhq.js`), `PORT` (default 3000).
 
-Start the server locally:
+---
 
-```bash
-npm start
+## 5. API reference
+
+All routes serve JSON. `episodeId` = `{season}-{episode}` for TV
+(e.g. `1-1`), or the TMDB id for movies. `mediaId` = `movie/{id}` or `tv/{id}`.
+
+| Route | Query | Returns |
+|---|---|---|
+| `GET /search` | `query`, `page` | TMDB multi-search, movies+TV |
+| `GET /info/:mediaId(*)` | — | Detail + credits + recommendations + episodes |
+| `GET /sources/:episodeId` | `mediaId`, `server?` | `{headers, sources[], subtitles[], provider, embedUrl}` |
+| `GET /servers/:episodeId` | `mediaId` | list of the 10 server names |
+| `GET /dubs/:episodeId` | `mediaId` | `{iron: ["Hindi",...], multi: [...]}` — audio languages |
+| `GET /recent/movies` · `GET /recent/tv` | — | TMDB now-playing / on-the-air |
+| `GET /trending/movies` · `GET /trending/tv` | — | TMDB trending week |
+| `GET /movies` · `GET /tv` | `page` | discover by popularity |
+| `GET /genre/:genre` | `page` | movies by genre name |
+| `GET /top-imdb` | `type=all\|movie\|tv`, `page` | top rated (vote_average desc) |
+| `GET /movie/embed/:movieId` | `server?` | every server's raw source URL + `isM3U8` |
+| `GET /tv/embed/:episodeId` | `server?` | same for TV (`episodeId` = `tvId:s-e`) |
+| `GET /play` | `url`, `ref?` | **stream pass-through proxy** (not JSON) |
+| `GET /` (fallback) | — | `public/index.html` |
+
+Rate limit: **600 requests / 15 min** on API routes. `/play` is always exempt
+(it can be called hundreds of times per movie). Static files are served before
+the limiter and never count.
+
+---
+
+## 6. Embed families (the core)
+
+### 6.1 Peachify — `x.eat-peach.sbs`
+
+One encrypted-JSON API, 5 internal providers. Browser-facing names are our own
+labels; the slug after the host is what the API expects.
+
+| Our name (button) | Path slug | Notes |
+|---|---|---|
+| `horizon` | `hr` | old default; English-only streams |
+| `wolf` | `air` | default in Auto mode |
+| `spider` | `holly` | |
+| `multi` | `multi` | has Tamil/Telugu/Hindi dubs |
+| `iron` | `moviebox` | has Hindi/French/Russian/Spanish etc. |
+
+**Request:** `GET https://x.eat-peach.sbs/{slug}/{movie|tv}/{id}[/{s}/{e}]`
+
+**Response payload:** `{"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}` where the
+three parts are base64url (no padding) and separated by `.`.
+
+**Decryption:** AES-256-GCM, key hex:
 ```
 
-The server will run on port 3000 by default (configurable via PORT environment variable).
+```
+(iv and tag are raw bytes from base64url decode; `authTagLength: 16`.)
 
-## Deployment
+**Decrypted shape:** `{ sources: [{ url, headers?, dub?, quality? }] }`
 
-### Deploy to Vercel
+- `dub` — the audio language label. Values seen: `English`, `Hindi`,
+  `Tamil`, `Telugu`, `Original Audio`, `French`, `Russian`, `Spanish`,
+  `esla` (Spanish LATAM), `ptbr` (Portuguese BR). This field is what the
+  **audio dropdown** is built on.
+- `headers` — extra headers for direct requests (usually empty; CDNs that
+  need them are handled by `/play` anyway).
 
-1. Install Vercel CLI:
-```bash
-npm install -g vercel
+**Subtitles:** `GET https://x.eat-peach.sbs/subs/{movie|tv}/{id}[/{s}/{e}]` →
+`[{ label, file, kind }]`.
+
+### 6.2 Vidnest — `new.vidnest.fun`
+
+Second family, added later. Same UX, different cipher and 3 possible response
+shapes.
+
+| Our name (button) | Path slug | Response shape |
+|---|---|---|
+| `videasy` | `videasy` | shape 1 — `{headers, url}` (tiktoks.animanga.fun relay) |
+| `hollymoviehd` | `hollymoviehd` | shape 2 — `{streams:[{url,type,headers,language}]}` |
+| `rogflix` | `rogflix` | (falls back through shapes) |
+| `buzz` | `buzz` | shape 3 — `{url, headers, referer, ...}` direct |
+| `ngc` | `nextgencloudfabric` | shape 3 |
+
+**Request:** `GET https://new.vidnest.fun/{provider}/{movie|tv}/{id}[/{s}/{e}]`
+with `Referer: https://vidnest.fun/` and a desktop Chrome UA.
+
+**Response payload:** `{"encrypted":true,"data":"<encoded>"}` — the data uses a
+**custom base64 alphabet**, not the standard one:
+
 ```
 
-2. Login to Vercel:
-```bash
-vercel login
 ```
+(61 chars + `=` padding; the standard alphabet `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/` maps position-wise onto it.) Decode in
+`vidnestDecode()` in `extractor.js`.
 
-3. Deploy:
-```bash
-vercel
-```
+**The 3 decrypted shapes** — a resolver must handle all of them; `vidnestToResult()`
+normalizes each into our standard `{url, isM3U8, headers, referer, label}`:
 
-For production deployment:
-```bash
-vercel --prod
-```
+| Shape | Looks like | Typical provider |
+|---|---|---|
+| 1. relay | `{headers, url}` pointing at `tiktoks.animanga.fun` | videasy |
+| 2. streams | `{streams:[{url, type, headers, language}]}` | hollymoviehd |
+| 3. direct | `{url, headers, referer, ...}` | buzz, ngc |
 
-The API will be deployed to a URL like: `https://your-project-name.vercel.app`
+**Subtitles:** `GET https://sub.vdrk.site/v2/{movie|tv}/{id}[/{s}/{e}]` →
+`[{ label, file }]` where `file` points at `cache.vdrk.site/...vtt` (CORS-open,
+played directly).
 
-### Environment Variables
+### 6.3 How `resolveStream` dispatches
 
-No environment variables are required for basic deployment. However, you can configure:
-- `PORT` - Port number for local development (default: 3000)
+`extractor.js` — order matters:
 
-### Project Structure
+1. `server` given and it's a **vidnest** name (`videasy`, `hollymoviehd`,
+   `rogflix`, `buzz`, `ngc`) → `resolveVidnest(provider)` only.
+2. `server` given and it's a **peachify** name (`horizon`, `wolf`, `spider`,
+   `multi`, `iron`) → that provider only.
+3. `server` null/`auto` → cycle all peachify providers in order
+   (horizon → wolf → spider → multi → iron), return the first with a
+   playable source; if all fail → cycle vidnest providers
+   (videasy → hollymoviehd → rogflix → buzz → ngc).
 
-```
-├── server.js           # Main server file
-├── flixhq.js          # FlixHQ scraper implementation
-├── models.js          # Data models and types
-├── extractors.js      # Video source extractors
-├── vercel.json        # Vercel deployment configuration
-├── package.json       # Project dependencies and scripts
-└── README.md          # Documentation
-```
+Every resolver result is cached in-memory (`providerCache`, `vidnestCache`),
+so switching servers mid-watch doesn't re-hit the APIs.
 
-## API Endpoints
+---
 
-### Search
-- `GET /search?query={searchTerm}&page={pageNumber}`
-  - Search for movies and TV shows
-  - Required: query parameter
-  - Optional: page parameter (default: 1)
+## 7. Stream delivery: direct vs `/play` proxy
 
-### Media Info
-- `GET /info/{mediaId}`
-  - Get detailed information about a movie or TV show
-  - mediaId format: `movie/xyz` or `tv/xyz`
+This is the single most important rule in the app — **getting it wrong makes
+playback 403**.
 
-### Sources & Servers
-- `GET /sources/{episodeId}?mediaId={mediaId}&server={serverName}`
-  - Get streaming sources for an episode/movie
-  - Required: episodeId, mediaId
-  - Optional: server (default: UpCloud)
+| Host | CORS | Route |
+|---|---|---|
+| `x.eat-peach.sbs` (HLS) | open | **direct** from browser |
+| `97bf1.com` (HLS) | open | **direct** |
+| `cache.vdrk.site` (VTT subs) | open | **direct** |
+| `tiktoks.animanga.fun` | Referer-gated | **`/play`** |
+| `akcloud` / `goodstream` / `hlmv.tripplestream.online` / `slast430did.com` / `azionedge` | Referer-gated | **`/play`** |
 
-- `GET /servers/{episodeId}?mediaId={mediaId}`
-  - Get available streaming servers
-  - Required: episodeId, mediaId
+`player.js` holds the allowlist as `PROXY_HOSTS =
+['eat-peach.sbs','97bf1.com','cache.vdrk.site']` → anything **not** in it goes
+through `/play`. If you add a new CDN host, you don't need to touch the list —
+new hosts default to the proxy, which is the safe choice.
 
-### Recent Content
-- `GET /recent/movies`
-  - Get recently added movies
-- `GET /recent/tv`
-  - Get recently added TV shows
+**`/play` contract** (`server.js`):
+- `?url=` (required, must start `http(s)://`), `?ref=` (Referer; defaults to
+  `https://peachify.top/`).
+- Sends `Referer`, a desktop Chrome UA, and any client `Range` header upstream.
+- **m3u8**: every URL in the playlist is rewritten to `/play` — bare segment
+  lines, `#EXT-X-MEDIA URI="..."` audio/subtitle groups, and absolute URLs
+  (the browser's own Referer would be our origin, which CDNs reject).
+- **mp4 / segments / VTT**: streamed through with `Access-Control-Allow-Origin:
+  *`, `Content-Range` preserved, `206` for ranges.
+- Response `Cache-Control: no-store`.
 
-### Trending Content
-- `GET /trending/movies`
-  - Get trending movies
-- `GET /trending/tv`
-  - Get trending TV shows
+---
 
-### Paginated Listings
-- `GET /movies?page={pageNumber}`
-  - Get movies list with pagination
-  - Optional: page parameter (default: 1)
+## 8. Frontend behavior
 
-- `GET /tv?page={pageNumber}`
-  - Get TV shows list with pagination
-  - Optional: page parameter (default: 1)
+| Feature | How it works |
+|---|---|
+| Server buttons | `GET /servers/...` lists the 10 names; "Auto" (default) lets the backend pick. Clicking a server reloads sources for it only. |
+| Auto-fallback | `player.js` keeps `_triedServers`; if a server fails mid-play it auto-advances in `SERVER_FALLBACK_ORDER = ['videasy','hollymoviehd','rogflix','buzz','ngc','horizon','wolf','spider','multi','iron']`, bounded by the tried list. |
+| Quality | hls.js levels (`hls.levels` / `hls.currentLevel` by height). Stored as **`myflixerz-quality`** in localStorage (`'auto'` = ABR, or an explicit height). Non-HLS (MP4) sources re-attach with the chosen source. |
+| Audio (dub) | Dropdown is always visible. `collectDubs()` reads the current server's `dub` values, then probes `GET /dubs` once (which checks iron + multi) and merges. Picking a language the current server lacks **auto-switches the server button** to the one that has it. Stored as **`myflixerz-audio`**. |
+| Subtitles | Merged from both subtitle APIs, deduped by label, populated on demand from the sources payload. VTT/SRT both parse. |
+| Skip intro | `api.theintrodb.org` lookup. |
 
-### Genre & IMDB
-- `GET /genre/{genreName}?page={pageNumber}`
-  - Get content by genre
-  - Required: genreName
-  - Optional: page parameter (default: 1)
+---
 
-- `GET /top-imdb?type={contentType}&page={pageNumber}`
-  - Get top IMDB rated content
-  - Optional: type parameter (default: 'all', options: 'movie', 'tv', 'all')
-  - Optional: page parameter (default: 1)
+## 9. Dead upstreams — do NOT re-crack
 
-### Embed Links
-- `GET /movie/embed/{movieId}`
-  - Get movie embed links with multiple server options
+These were fully investigated; the failures are on the upstream side and no
+amount of client-side work will fix them. If someone re-adds one of these
+names, it will waste a day.
 
-- `GET /tv/embed/{episodeId}`
-  - Get TV episode embed links with multiple server options
+| Server | Host | Verdict |
+|---|---|---|
+| `vidcore` | vidcore CDN | embed API fully deobfuscated (rotation K=179, endpoints decoded) but backend **500s on every input**; player is bot-gated |
+| `vidfast` | vidfast CDN | same crack, same **500s** |
+| `vidsrc` | vidsrc-embed.ru | **Cloudflare 403** at the edge |
+| `vidify` | player.vidify.top | **HTTP 522** (origin down) |
 
-## Response Formats
+---
 
-### Media Info Response
-```json
-{
-  "id": "string",
-  "title": "string",
-  "url": "string",
-  "cover": "string",
-  "image": "string",
-  "description": "string",
-  "type": "MOVIE | TVSERIES",
-  "releaseDate": "string",
-  "genres": ["string"],
-  "casts": ["string"],
-  "production": "string",
-  "country": "string",
-  "duration": "string",
-  "rating": number,
-  "recommendations": [
-    {
-      "id": "string",
-      "title": "string",
-      "image": "string",
-      "type": "MOVIE | TVSERIES"
-    }
-  ],
-  "episodes": [
-    {
-      "id": "string",
-      "title": "string",
-      "number": number,
-      "season": number,
-      "url": "string"
-    }
-  ]
-}
-```
+## 10. How to add a new server (the recipe)
 
-### Sources Response
-```json
-{
-  "headers": {
-    "Referer": "string"
-  },
-  "sources": [
-    {
-      "url": "string",
-      "quality": "string",
-      "isM3U8": boolean
-    }
-  ],
-  "subtitles": [
-    {
-      "url": "string",
-      "lang": "string"
-    }
-  ]
-}
-```
+Follow this order and it works first time:
 
-## Rate Limiting
+1. **Find the embed API.** The embed page loads JS that builds a payload URL
+   (a JSON API, not a scrape target). `curl` the API with the embed page's
+   `Referer` + a desktop Chrome UA.
+2. **Identify the cipher.** Fetch the JS, locate the decrypt function. If it's
+   obfuscated: **do not hand-transcribe it** — extract the exact function text
+   (`page.evaluate(() => fn.toString())`) and evaluate it in Node. Feed it a
+   known sample payload and confirm it decrypts before writing any code.
+3. **Implement the decoder in `extractor.js`** mirroring `vidnestDecode` /
+   `decryptPayload`. Add a resolver function + a `XXXCache` Map.
+4. **Probe it live first** (a script in `/tmp`) against a real movie and a real
+   TV episode — confirm `sources` parse and the URL is reachable (`curl -I`
+   with the referer).
+5. **Normalize to our source shape** in `toResult` / `vidnestToResult`:
+   `{url, isM3U8, headers, referer, label}` — and keep `dub` semantics if the
+   API exposes audio languages.
+6. **Wire it up (4 places):**
+   - `extractor.js`: add name to `VIDNEST_PROVIDERS` (or `PROVIDERS`) and a
+     branch in `resolveStream` dispatch.
+   - `flixhq.js`: `SERVERS` is built from those arrays automatically.
+   - `app.js`: add a friendly label to `PROVIDER_LABELS`.
+   - `player.js`: add the name to `SERVER_FALLBACK_ORDER` (before peachify
+     names if it's more reliable).
+7. **Test via API, then UI:** `curl localhost:3000/sources/1-1?mediaId=movie/603&server=<name>`, then play it in the browser and watch for CDN 403s — if the
+   CDN host isn't in `PROXY_HOSTS`, playback must still work through `/play`
+   (it will, automatically).
 
-The API implements rate limiting with the following defaults:
-- 100 requests per 15 minutes per IP address
+> **CORS check is the last step, not the first:** a new CDN host is
+> Referer-gated by default → `/play` handles it. Only move a host into
+> `PROXY_HOSTS` if you've confirmed it serves `Access-Control-Allow-Origin`
+> for foreign origins.
 
-## Error Handling
+---
 
-The API returns appropriate HTTP status codes:
-- 200: Success
-- 400: Bad Request (missing or invalid parameters)
-- 404: Not Found
-- 429: Too Many Requests (rate limit exceeded)
-- 500: Internal Server Error
+## 11. When upstreams change — what you actually touch
 
-Error responses include a JSON object with an error message:
-```json
-{
-  "error": "Error message description"
-}
-```
+The architecture is a fixed pipeline; upstream servers are swappable parts. All
+upstream knowledge lives in `extractor.js`, so changes are constant edits, not
+redesigns.
 
-## Dependencies
+| Upstream change | What you touch | Architecture change? |
+|---|---|---|
+| Encryption key / alphabet rotated | `PEACHIFY_KEY_HEX` / `VIDNEST_ALPHABET` in `extractor.js` | No |
+| JSON response shape changed | `toResult` / `vidnestToResult` normalizers | No |
+| New CDN host for streams | **Nothing** — unknown hosts default to `/play` automatically | No |
+| New CDN host that is CORS-open | Optional: add to `PROXY_HOSTS` in `player.js` (skips proxy) | No |
+| Base domain moves (e.g. `x.eat-peach.sbs` dies) | Base URL constant + `PROXY_HOSTS` entry | No |
+| A server dies entirely (like vidcore) | Nothing — Auto mode skips it, others cover | No |
+| New provider inside an existing family | One entry in the provider map | No |
+| Entire family dies; a brand-new one appears | New resolver in `extractor.js` (recipe §10) — plugs into the same pipeline | No |
 
-- express
-- cors
-- express-rate-limit
-- axios
-- cheerio
+Why this holds: `resolveStream` normalizes every family to the same
+`{url, isM3U8, headers, referer}` shape; `/play` absorbs all CDN quirks
+(referer-gating, CORS, playlist rewriting); and the "unknown host → proxy"
+rule makes misconfiguration impossible.
 
-## License
+The only things that would force a real architecture change: upstreams
+abandoning JSON APIs for something structurally different (HTML scraping,
+websocket streams), or new requirements like multi-user auth or real-time
+features.
 
-MIT License 
+---
+
+## 12. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| All servers fail on one title | Upstream availability, not our code — Auto mode cycles through all 10; retry later. Peachify CDNs are periodically flaky (502s). |
+| Black player on a specific server | That provider's CDN is down; switch server or use Auto. |
+| Segments 403 in devtools | Host must not be direct-played; check `PROXY_HOSTS` — new hosts should stay proxied. |
+| `EADDRINUSE` on restart | Old instance still on :3000. `pgrep -f 'node server\.js'` and kill it, never `pkill -f "node server"` from a shell that spawned it (the pattern can match the shell itself). |
+| Audio dropdown empty | No dub-capable provider answered; the API's `/dubs` probe failed for both iron and multi (transient upstream). |
+| 429s | Hitting the 600/15-min API limit — normally only /play is hot, which is exempt. |
+
+## 13. Deployment
+
+`vercel.json` builds the whole app as a single `@vercel/node` function from
+`server.js`; all routes fall through to it. The rate limiter and `/play` proxy
+work there unchanged. For a VPS: plain `node server.js` behind nginx with
+`proxy_buffering off` for `/play` if you see stutter.

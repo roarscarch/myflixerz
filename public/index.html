@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MyFlixz — Watch Movies &amp; TV Shows</title>
+  <meta name="description" content="Stream movies and TV shows instantly. Search, browse, and watch in HD." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+</head>
+<body>
+  <div id="app">
+    <header class="nav" id="nav">
+      <a class="brand" href="#/">My<span>Flixz</span></a>
+      <nav class="nav-links" id="navLinks">
+        <a href="#/movies" data-nav="movies">Movies</a>
+        <a href="#/tv-shows" data-nav="tv">TV Shows</a>
+        <a href="#/top-rated" data-nav="top">Top Rated</a>
+      </nav>
+      <div class="search-box" id="searchBox">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="navSearch" type="text" placeholder="Search movies &amp; shows…" autocomplete="off" spellcheck="false" />
+        <div class="search-dropdown" id="searchDropdown"></div>
+      </div>
+      <button class="icon-btn" id="searchToggle" aria-label="Search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+    </header>
+
+    <main id="view"></main>
+
+    <footer class="footer">
+      <div class="brand">My<span>Flixz</span></div>
+      <p>Unlimited movies &amp; TV shows. Stream on any device.</p>
+      <p class="disclaimer">For personal use only. All metadata via TMDB.</p>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+  <script src="/js/api.js"></script>
+  <script src="/js/player.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

@@ -1,689 +1,324 @@
-const cheerio = require('cheerio');
 const axios = require('axios');
-const { MovieParser, TvType, StreamingServers } = require('./models');
-const { MixDrop, VidCloud, VideoExtractor } = require('./extractors');
+const { TvType } = require('./models');
+const { resolveStream, fetchSubtitles, fetchVidnestSubtitles, PROVIDERS, VIDNEST_PROVIDERS } = require('./extractor');
 
-class FlixHQ extends MovieParser {
+// Public TMDB key used by myflixerfree.to (override via TMDB_API_KEY env).
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+const IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
+
+// Stream servers = peachify's internal providers (Horizon/Wolf/Spider/Multi/Iron)
+// plus vidnest's (Videasy/HollyMovie/Rogflix/Buzz/NGC). Each is a direct JSON
+// API — no scraping, no browser. resolveStream dispatches by name.
+const SERVERS = [...PROVIDERS, ...VIDNEST_PROVIDERS];
+
+class FlixHQ {
   constructor() {
-    super();
     this.name = 'MyFlixHQ';
-    this.baseUrl = 'https://myflixerz.to';
-    this.logo = 'https://myflixerz.to/images/logo.png';
-    this.classPath = 'MOVIES.MyFlixHQ';
-    this.supportedTypes = new Set([TvType.MOVIE, TvType.TVSERIES]);
-    this.client = axios.create({
-      baseURL: this.baseUrl,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      },
-    });
+    this.baseUrl = 'https://myflixerfree.to';
+    this.tmdb = axios.create({ baseURL: TMDB_BASE, params: { api_key: TMDB_API_KEY } });
+    this._genresCache = null;
   }
+
+  // ---- helpers ----
+
+  _img(path) {
+    return path ? `${IMAGE_BASE}${path}` : null;
+  }
+
+  _playerUrl(type, id, title, season, episode) {
+    const params = new URLSearchParams({ id, type, title: title || 'Watch Now' });
+    if (type === 'tv' && season && episode) {
+      params.set('season', season);
+      params.set('episode', episode);
+    }
+    return `${this.baseUrl}/player?${params.toString()}`;
+  }
+
+  _item(id, tmdbItem, type) {
+    const title = tmdbItem.title || tmdbItem.name;
+    return {
+      id: `${type}/${tmdbItem.id}`,
+      title,
+      url: this._playerUrl(type, tmdbItem.id, title),
+      image: this._img(tmdbItem.poster_path || tmdbItem.backdrop_path),
+      releaseDate: (tmdbItem.release_date || tmdbItem.first_air_date || '').split('-')[0] || undefined,
+      type: type === 'movie' ? TvType.MOVIE : TvType.TVSERIES,
+    };
+  }
+
+  async _genres() {
+    if (!this._genresCache) {
+      const [{ data: movies }, { data: tv }] = await Promise.all([
+        this.tmdb.get('/genre/movie/list'),
+        this.tmdb.get('/genre/tv/list'),
+      ]);
+      const map = {};
+      [...movies.genres, ...tv.genres].forEach((g) => {
+        map[g.name.toLowerCase()] = g.id;
+      });
+      this._genresCache = map;
+    }
+    return this._genresCache;
+  }
+
+  async _discover(type, page, extra = {}) {
+    const { data } = await this.tmdb.get(`/discover/${type}`, {
+      params: { page, sort_by: 'popularity.desc', ...extra },
+    });
+    return {
+      currentPage: data.page,
+      hasNextPage: data.page < data.total_pages,
+      results: data.results.map((r) => this._item(type, r, type)),
+    };
+  }
+
+  // ---- search ----
 
   async search(query, page = 1) {
-    const searchResult = {
-      currentPage: page,
-      hasNextPage: false,
-      results: []
-    };
-
-    try {
-      const { data } = await this.client.get(
-        `${this.baseUrl}/search/${query.replace(/[\W_]+/g, '-')}?page=${page}`
-      );
-
-      const $ = cheerio.load(data);
-      const navSelector = '.pagination';
-
-      searchResult.hasNextPage =
-        $(navSelector).length > 0 ? !$(navSelector).children().last().hasClass('active') : false;
-
-      $('.flw-item').each((i, el) => {
-        const releaseDate = $(el).find('.fd-infor .fdi-item:first-child').text();
-        searchResult.results.push({
-          id: $(el).find('.film-poster-ahref').attr('href')?.slice(1),
-          title: $(el).find('.film-name a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('.film-poster-ahref').attr('href')}`,
-          image: $(el).find('.film-poster-img').attr('data-src'),
-          releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-          seasons: releaseDate.includes('SS') ? parseInt(releaseDate.split('SS')[1]) : undefined,
-          type:
-            $(el).find('.fd-infor .fdi-type').text().toLowerCase() === 'movie'
-              ? TvType.MOVIE
-              : TvType.TVSERIES
-        });
-      });
-
-      return searchResult;
-    } catch (err) {
-      throw new Error(err.message);
-    }
+    const { data } = await this.tmdb.get('/search/multi', {
+      params: { query, page, include_adult: 'false' },
+    });
+    const results = data.results
+      .filter((r) => r.media_type === 'movie' || r.media_type === 'tv')
+      .map((r) => this._item(r.media_type, r, r.media_type));
+    return { currentPage: data.page, hasNextPage: data.page < data.total_pages, results };
   }
+
+  // ---- media info ----
 
   async fetchMediaInfo(mediaId) {
-    if (!mediaId.startsWith(this.baseUrl)) {
-      mediaId = `${this.baseUrl}/${mediaId}`;
-    }
+    const [type, id] = mediaId.split('/');
+    if (type !== 'movie' && type !== 'tv') throw new Error('Invalid media ID format');
 
-    const movieInfo = {
-      id: mediaId.split('to/').pop(),
-      title: '',
-      url: mediaId
+    const { data } = await this.tmdb.get(`/${type}/${id}`, {
+      params: { append_to_response: 'credits,recommendations,videos' },
+    });
+
+    const title = data.title || data.name;
+    const info = {
+      id: `${type}/${data.id}`,
+      title,
+      url: this._playerUrl(type, data.id, title),
+      cover: this._img(data.backdrop_path),
+      image: this._img(data.poster_path),
+      description: data.overview,
+      type: type === 'movie' ? TvType.MOVIE : TvType.TVSERIES,
+      releaseDate: data.release_date || data.first_air_date,
+      genres: (data.genres || []).map((g) => g.name),
+      casts: (data.credits?.cast || []).slice(0, 15).map((c) => c.name),
+      production: (data.production_companies || []).slice(0, 3).map((c) => c.name),
+      country: (data.production_countries || []).map((c) => c.name),
+      duration: type === 'movie' ? `${data.runtime || 0} min` : undefined,
+      rating: data.vote_average || 0,
+      recommendations: (data.recommendations?.results || []).slice(0, 12).map((r) => this._item(type, r, type)),
     };
 
-    try {
-      const { data } = await this.client.get(mediaId);
-      const $ = cheerio.load(data);
-      const recommendationsArray = [];
-
-      $('.film_list-wrap .flw-item').each((i, el) => {
-        recommendationsArray.push({
-          id: $(el).find('.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('.film-name > a').attr('title'),
-          image: $(el).find('.film-poster > img').attr('data-src'),
-          duration: $(el).find('.fd-infor .fdi-duration').text().trim() || null,
-          type: $(el).find('.fd-infor .fdi-type').text().toLowerCase().includes('tv') ? TvType.TVSERIES : TvType.MOVIE
-        });
-      });
-
-      const uid = $('.detail_page-watch').attr('data-id');
-      movieInfo.cover = $('.film-poster-img').attr('src');
-      movieInfo.title = $('.heading-name').text().trim();
-      movieInfo.image = $('.film-poster-img').attr('src');
-      movieInfo.description = $('.description').text().trim();
-      movieInfo.type = mediaId.includes('/movie/') ? TvType.MOVIE : TvType.TVSERIES;
-
-      // Extract duration from the button
-      const durationText = $('.btn-quality').next('.btn-sm:contains("min")').text().trim();
-      if (durationText) {
-        movieInfo.duration = durationText;
-      } else {
-        // Alternative selector
-        movieInfo.duration = $('.row-line:contains("Duration")').text().replace('Duration:', '').trim();
-      }
-
-      // Extract IMDB rating
-      const imdbText = $('.btn-imdb').text().trim();
-      if (imdbText) {
-        const ratingMatch = imdbText.match(/IMDB: (\d+\.\d+)/);
-        movieInfo.rating = ratingMatch ? parseFloat(ratingMatch[1]) : 0;
-      }
-
-      // Extract release date, genre, casts, production, country
-      $('.elements .row-line').each((i, el) => {
-        const typeText = $(el).find('.type strong').text().trim().toLowerCase();
-        
-        if (typeText.includes('released')) {
-          movieInfo.releaseDate = $(el).text().replace(/Released:|\s+/g, ' ').trim();
-        } 
-        else if (typeText.includes('genre')) {
-          movieInfo.genres = $(el).find('a')
-            .map((i, genreEl) => $(genreEl).text().trim())
-            .get()
-            .filter(Boolean);
-        } 
-        else if (typeText.includes('cast')) {
-          movieInfo.casts = $(el).find('a')
-            .map((i, castEl) => $(castEl).text().trim())
-            .get()
-            .filter(Boolean);
+    // episodes for TV
+    if (type === 'tv') {
+      info.episodes = [];
+      const seasonCount = Math.min(data.number_of_seasons || 0, 10);
+      for (let s = 1; s <= seasonCount; s++) {
+        try {
+          const { data: seasonData } = await this.tmdb.get(`/tv/${id}/season/${s}`);
+          for (const ep of seasonData.episodes || []) {
+            info.episodes.push({
+              id: `${s}-${ep.episode_number}`,
+              title: ep.name,
+              number: ep.episode_number,
+              season: s,
+              url: this._playerUrl('tv', data.id, title, s, ep.episode_number),
+            });
+          }
+        } catch (e) {
+          break; // season has no episodes
         }
-        else if (typeText.includes('production')) {
-          movieInfo.production = $(el).find('a')
-            .map((i, prodEl) => $(prodEl).text().trim())
-            .get()
-            .filter(Boolean)
-            .join('');
-        }
-        else if (typeText.includes('country')) {
-          movieInfo.country = $(el).find('a')
-            .map((i, countryEl) => $(countryEl).text().trim())
-            .get()
-            .filter(Boolean)
-            .join('');
-        }
-        else if (typeText.includes('duration')) {
-          movieInfo.duration = $(el).text().replace('Duration:', '').trim();
-        }
-      });
-
-      movieInfo.recommendations = recommendationsArray;
-
-      if (movieInfo.type === TvType.TVSERIES) {
-        const { data: seasonData } = await this.client.get(`${this.baseUrl}/ajax/season/list/${uid}`);
-        const $$ = cheerio.load(seasonData);
-        const seasonsIds = $$('.dropdown-menu a')
-          .map((i, el) => $(el).attr('data-id'))
-          .get();
-
-        movieInfo.episodes = [];
-        let season = 1;
-        for (const id of seasonsIds) {
-          const { data: episodeData } = await this.client.get(`${this.baseUrl}/ajax/season/episodes/${id}`);
-          const $$$ = cheerio.load(episodeData);
-
-          $$$('.nav > li').each((i, el) => {
-            const episode = {
-              id: $$$(el).find('a').attr('data-id'),
-              title: $$$(el).find('a').attr('title'),
-              number: parseInt($$$(el).find('a').attr('title')?.match(/Eps (\d+)/)?.[1] || '0'),
-              season: season,
-              url: `${this.baseUrl}/ajax/episode/servers/${$$$(el).find('a').attr('data-id')}`
-            };
-            movieInfo.episodes.push(episode);
-          });
-          season++;
-        }
-      } else {
-        movieInfo.episodes = [{
-          id: uid,
-          title: movieInfo.title,
-          url: `${this.baseUrl}/ajax/movie/servers/${uid}`
-        }];
       }
-
-      return movieInfo;
-    } catch (err) {
-      throw new Error(err.message);
+    } else {
+      info.episodes = [{ id, title, number: 1, season: 1, url: this._playerUrl('movie', data.id, title) }];
     }
+
+    return info;
   }
 
-  async fetchEpisodeSources(episodeId, mediaId, server = StreamingServers.UpCloud) {
-    if (episodeId.startsWith('http')) {
-      const serverUrl = new URL(episodeId);
-      switch (server) {
-        case StreamingServers.MixDrop:
-          return {
-            headers: { Referer: serverUrl.href },
-            sources: await new MixDrop(this.proxyConfig, this.adapter).extract(serverUrl)
-          };
-        case StreamingServers.VidCloud:
-          return {
-            headers: { Referer: serverUrl.href },
-            ...(await new VidCloud(this.proxyConfig, this.adapter).extract(serverUrl, true, this.baseUrl))
-          };
-        case StreamingServers.UpCloud:
-          return {
-            headers: { Referer: serverUrl.href },
-            ...(await new VidCloud(this.proxyConfig, this.adapter).extract(serverUrl, undefined, this.baseUrl))
-          };
-        default:
-          return {
-            headers: { Referer: serverUrl.href },
-            sources: await new MixDrop(this.proxyConfig, this.adapter).extract(serverUrl)
-          };
+  // ---- servers & sources ----
+
+  async fetchEpisodeServers() {
+    return SERVERS.map((s) => ({ name: s.name }));
+  }
+
+  async fetchEpisodeSources(episodeId, mediaId, server = null) {
+    const [type, id] = mediaId.split('/');
+    if (!type || !id) throw new Error('mediaId must be movie/{id} or tv/{id}');
+
+    let season = 1;
+    let episode = 1;
+    if (type === 'tv') {
+      const m = String(episodeId || '').match(/^(?:s)?(\d+)(?:e|[-/])(\d+)$/i);
+      if (m) {
+        season = m[1];
+        episode = m[2];
+      } else if (episodeId.includes('-')) {
+        [season, episode] = episodeId.split('-');
       }
     }
 
-    try {
-      const servers = await this.fetchEpisodeServers(episodeId, mediaId);
-      const i = servers.findIndex(s => s.name === server);
+    // resolveStream dispatches peachify vs vidnest by server name; with no
+    // server it auto-cycles peachify then falls back to vidnest. Subtitles are
+    // merged from both families' APIs (each is title-level, not provider-level).
+    const [stream, subs, vsubs] = await Promise.all([
+      resolveStream({ type, id, season, episode, server }),
+      fetchSubtitles(type, id, season, episode),
+      fetchVidnestSubtitles(type, id, season, episode),
+    ]);
+    const seen = new Set();
+    const subtitles = [...subs, ...vsubs].filter((s) => {
+      if (seen.has(s.label)) return false;
+      seen.add(s.label);
+      return true;
+    });
+    const embedUrl = this._playerUrl(type, id, '', season, episode);
 
-      if (i === -1) {
-        throw new Error(`Server ${server} not found`);
-      }
-
-      const { data } = await this.client.get(
-        `${this.baseUrl}/ajax/sources/${servers[i].url.split('.').slice(-1).shift()}`
-      );
-
-      const serverUrl = new URL(data.link);
-      return await this.fetchEpisodeSources(serverUrl.href, mediaId, server);
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchEpisodeServers(episodeId, mediaId) {
-    if (!episodeId.startsWith(this.baseUrl + '/ajax') && !mediaId.includes('movie'))
-      episodeId = `${this.baseUrl}/ajax/episode/servers/${episodeId}`;
-    else
-      episodeId = `${this.baseUrl}/ajax/movie/servers/${episodeId}`;
-
-    try {
-      const { data } = await this.client.get(episodeId);
-      const $ = cheerio.load(data);
-
-      return $('.nav li').map((i, el) => ({
-        name: $(el).find('a').attr('title')?.toLowerCase(),
-        url: `${this.baseUrl}/${mediaId}.${$(el).find('a').attr('data-id')}`.replace(
-          mediaId.includes('movie') ? /\/movie\// : /\/tv\//,
-          mediaId.includes('movie') ? '/watch-movie/' : '/watch-tv/'
-        )
-      })).get();
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchRecentMovies() {
-    try {
-      const { data } = await this.client.get('/home');
-      const $ = cheerio.load(data);
-
-      const movies = $('section.block_area:contains("Latest Movies") > div:nth-child(2) > div:nth-child(1) > div.flw-item')
-        .map((i, el) => {
-          const releaseDate = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-          const duration = $(el).find('div.film-detail > div.fd-infor > span.fdi-duration').text();
-          return {
-            id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-            title: $(el).find('div.film-detail > h3.film-name > a').attr('title'),
-            url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-            image: $(el).find('div.film-poster > img').attr('data-src'),
-            releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-            duration: duration || undefined,
-            type: TvType.MOVIE,
-          };
-        })
-        .get();
-
-      return movies;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchRecentTvShows() {
-    try {
-      const { data } = await this.client.get('/home');
-      const $ = cheerio.load(data);
-
-      const tvshows = $('section.block_area:contains("Latest TV Shows") > div:nth-child(2) > div:nth-child(1) > div.flw-item')
-        .map((i, el) => ({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h3.film-name > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          season: $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text(),
-          latestEpisode: $(el).find('div.film-detail > div.fd-infor > span:nth-child(3)').text() || undefined,
-          type: TvType.TVSERIES,
-        }))
-        .get();
-
-      return tvshows;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchTrendingMovies() {
-    try {
-      const { data } = await this.client.get('/home');
-      const $ = cheerio.load(data);
-
-      const movies = $('div#trending-movies div.film_list-wrap div.flw-item')
-        .map((i, el) => {
-          const releaseDate = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-          const duration = $(el).find('div.film-detail > div.fd-infor > span.fdi-duration').text();
-          return {
-            id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-            title: $(el).find('div.film-detail > h3.film-name > a').attr('title'),
-            url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-            image: $(el).find('div.film-poster > img').attr('data-src'),
-            releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-            duration: duration || undefined,
-            type: TvType.MOVIE,
-          };
-        })
-        .get();
-
-      return movies;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchTrendingTvShows() {
-    try {
-      const { data } = await this.client.get('/home');
-      const $ = cheerio.load(data);
-
-      const tvshows = $('div#trending-tv div.film_list-wrap div.flw-item')
-        .map((i, el) => ({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h3.film-name > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          season: $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text(),
-          latestEpisode: $(el).find('div.film-detail > div.fd-infor > span:nth-child(3)').text() || undefined,
-          type: TvType.TVSERIES,
-        }))
-        .get();
-
-      return tvshows;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchMoviesByPage(page = 1) {
-    try {
-      const { data } = await this.client.get(`/movie?page=${page}`);
-      const $ = cheerio.load(data);
-
-      const results = {
-        currentPage: page,
-        hasNextPage: false,
-        results: [],
-      };
-
-      const navSelector = 'div.pre-pagination:nth-child(3) > nav:nth-child(1) > ul:nth-child(1)';
-      results.hasNextPage = $(navSelector).length > 0 
-        ? !$(navSelector).children().last().hasClass('active') 
-        : false;
-
-      $('div.film_list-wrap > div.flw-item').each((i, el) => {
-        const releaseDate = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-        const duration = $(el).find('div.film-detail > div.fd-infor > span.fdi-duration').text();
-        
-        results.results.push({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h2 > a, div.film-detail > h3 > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-          duration: duration || undefined,
-          type: TvType.MOVIE,
-        });
-      });
-
-      return results;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchTvShowsByPage(page = 1) {
-    try {
-      const { data } = await this.client.get(`/tv-show?page=${page}`);
-      const $ = cheerio.load(data);
-
-      const results = {
-        currentPage: page,
-        hasNextPage: false,
-        results: [],
-      };
-
-      const navSelector = 'div.pre-pagination:nth-child(3) > nav:nth-child(1) > ul:nth-child(1)';
-      results.hasNextPage = $(navSelector).length > 0 
-        ? !$(navSelector).children().last().hasClass('active') 
-        : false;
-
-      $('div.film_list-wrap > div.flw-item').each((i, el) => {
-        const season = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-        const latestEpisode = $(el).find('div.film-detail > div.fd-infor > span:nth-child(3)').text();
-        
-        results.results.push({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h2 > a, div.film-detail > h3 > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          season: season,
-          latestEpisode: latestEpisode || undefined,
-          type: TvType.TVSERIES,
-        });
-      });
-
-      return results;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchByGenre(genre, page = 1) {
-    try {
-      const { data } = await this.client.get(`/genre/${genre}?page=${page}`);
-      const $ = cheerio.load(data);
-
-      const results = {
-        currentPage: page,
-        hasNextPage: false,
-        results: [],
-      };
-
-      const navSelector = 'div.pre-pagination:nth-child(3) > nav:nth-child(1) > ul:nth-child(1)';
-      results.hasNextPage = $(navSelector).length > 0 
-        ? !$(navSelector).children().last().hasClass('active') 
-        : false;
-
-      $('div.film_list-wrap > div.flw-item').each((i, el) => {
-        const type = $(el).find('div.film-detail > div.fd-infor > span.float-right').text();
-        const releaseDate = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-        const duration = $(el).find('div.film-detail > div.fd-infor > span.fdi-duration').text();
-        const latestEpisode = type === 'TV' ? $(el).find('div.film-detail > div.fd-infor > span:nth-child(3)').text() : undefined;
-        
-        results.results.push({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h2 > a, div.film-detail > h3 > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-          duration: duration || undefined,
-          latestEpisode,
-          type: type === 'TV' ? TvType.TVSERIES : TvType.MOVIE,
-        });
-      });
-
-      return results;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async fetchTopIMDB(type = 'all', page = 1) {
-    try {
-      const { data } = await this.client.get(`/top-imdb?type=${type}&page=${page}`);
-      const $ = cheerio.load(data);
-
-      const results = {
-        currentPage: page,
-        hasNextPage: false,
-        results: [],
-      };
-
-      const navSelector = 'div.pre-pagination:nth-child(3) > nav:nth-child(1) > ul:nth-child(1)';
-      results.hasNextPage = $(navSelector).length > 0 
-        ? !$(navSelector).children().last().hasClass('active') 
-        : false;
-
-      $('div.film_list-wrap > div.flw-item').each((i, el) => {
-        const type = $(el).find('div.film-detail > div.fd-infor > span.float-right').text();
-        const releaseDate = $(el).find('div.film-detail > div.fd-infor > span:nth-child(1)').text();
-        const duration = $(el).find('div.film-detail > div.fd-infor > span.fdi-duration').text();
-        const rating = $(el).find('div.film-detail > div.fd-infor > span.float-right').prev().text();
-        const latestEpisode = type === 'TV' ? $(el).find('div.film-detail > div.fd-infor > span:nth-child(3)').text() : undefined;
-        
-        results.results.push({
-          id: $(el).find('div.film-poster > a').attr('href')?.slice(1),
-          title: $(el).find('div.film-detail > h2 > a, div.film-detail > h3 > a').attr('title'),
-          url: `${this.baseUrl}${$(el).find('div.film-poster > a').attr('href')}`,
-          image: $(el).find('div.film-poster > img').attr('data-src'),
-          releaseDate: isNaN(parseInt(releaseDate)) ? undefined : releaseDate,
-          duration: duration || undefined,
-          rating: rating || undefined,
-          latestEpisode,
-          type: type === 'TV' ? TvType.TVSERIES : TvType.MOVIE,
-        });
-      });
-
-      return results;
-    } catch (err) {
-      throw new Error(err.message);
-    }
-  }
-
-  async extractDirectLinks(embedUrl) {
-    try {
-      const videoExtractor = new VideoExtractor();
-      const data = await videoExtractor.extract(embedUrl, 'https://myflixerz.to');
-
-      if (!data.sources || !data.sources[0]) {
-        throw new Error('No sources found');
-      }
-
-      return {
-        url: data.sources[0].file,
-        isM3U8: data.sources[0].type === 'hls',
-        quality: 'auto',
-        subtitles: data.tracks || []
-      };
-    } catch (err) {
-      throw new Error(err.message);
-    }
+    return {
+      headers: { Referer: 'https://peachify.top/' },
+      sources: stream.sources,
+      subtitles,
+      provider: stream.provider,
+      server: stream.provider,
+      embedUrl,
+    };
   }
 
   async fetchMovieEmbedLinks(movieId, serverName = null) {
-    try {
-      const { data: serverData } = await this.client.get(`${this.baseUrl}/ajax/episode/list/${movieId}`);
-      const $ = cheerio.load(serverData);
-
-      // If serverName is provided, only fetch that specific server
-      if (serverName) {
-        const serverElement = $('.nav-item a').filter((i, el) => {
-          return $(el).find('span').text().toLowerCase() === serverName.toLowerCase();
+    const servers = serverName ? SERVERS.filter((s) => s.name === serverName) : SERVERS;
+    const results = [];
+    for (const s of servers) {
+      try {
+        const stream = await resolveStream({ type: 'movie', id: movieId, server: s.name });
+        results.push({
+          server: s.name,
+          url: stream.sources[0]?.url || null,
+          isM3U8: stream.sources[0]?.isM3U8 ?? false,
         });
-
-        if (serverElement.length === 0) {
-          throw new Error(`Server "${serverName}" not found`);
-        }
-
-        const serverId = serverElement.attr('data-id');
-        if (!serverId) {
-          throw new Error(`No source ID found for server "${serverName}"`);
-        }
-
-        const { data: sourceData } = await this.client.get(`${this.baseUrl}/ajax/episode/sources/${serverId}`);
-        if (!sourceData || !sourceData.link) {
-          throw new Error(`No source link found for server "${serverName}"`);
-        }
-
-        const embedUrl = sourceData.link;
-        const directSource = await this.extractDirectLinks(embedUrl);
-        
-        return {
-          id: movieId,
-          server: serverName,
-          ...directSource
-        };
+      } catch (e) {
+        console.error(`[embed] ${s.name} failed for ${movieId}:`, e.message);
       }
-
-      // If no serverName provided, fetch all servers (original behavior)
-      const sources = [];
-      const serverPromises = $('.nav-item a').map(async (i, el) => {
-        const serverId = $(el).attr('data-id');
-        const serverName = $(el).find('span').text();
-        
-        if (serverId) {
-          try {
-            const { data: sourceData } = await this.client.get(`${this.baseUrl}/ajax/episode/sources/${serverId}`);
-            
-            if (sourceData && sourceData.link) {
-              const embedUrl = sourceData.link;
-              try {
-                const directSource = await this.extractDirectLinks(embedUrl);
-                if (directSource) {
-                  sources.push({
-                    server: serverName,
-                    ...directSource
-                  });
-                }
-              } catch (err) {
-                console.error(`Failed to extract direct link from ${serverName}:`, err);
-              }
-            }
-          } catch (err) {
-            console.error(`Failed to fetch source data from server ${serverId}:`, err);
-          }
-        }
-      }).get();
-
-      await Promise.all(serverPromises);
-
-      return {
-        id: movieId,
-        sources: sources
-      };
-    } catch (err) {
-      console.error('Error in fetchMovieEmbedLinks:', err);
-      throw new Error(`Failed to fetch movie embed links: ${err.message}`);
     }
+    return { id: movieId, sources: results };
   }
 
   async fetchTvEpisodeEmbedLinks(episodeId, serverName = null) {
-    try {
-      const { data: serverData } = await this.client.get(`${this.baseUrl}/ajax/episode/servers/${episodeId}`);
-      const $ = cheerio.load(serverData);
+    // episodeId format: {season}-{episode}?{tvId} -> tvId comes from mediaId query in server.js;
+    // here we parse "tvId:s-e" when passed directly.
+    const [tvId, se] = episodeId.includes(':') ? episodeId.split(':') : [null, episodeId];
+    if (!tvId) throw new Error('episodeId must be tvId:s{e} e.g. 1396:1-3');
+    const m = se.match(/^(\d+)-(\d+)$/);
+    if (!m) throw new Error('episodeId must be tvId:s{e} e.g. 1396:1-3');
+    const [, season, episode] = m;
 
-      // If serverName is provided, only fetch that specific server
-      if (serverName) {
-        const serverElement = $('.nav-item a').filter((i, el) => {
-          return $(el).find('span').text().toLowerCase() === serverName.toLowerCase();
+    const servers = serverName ? SERVERS.filter((s) => s.name === serverName) : SERVERS;
+    const results = [];
+    for (const s of servers) {
+      try {
+        const stream = await resolveStream({ type: 'tv', id: tvId, season, episode, server: s.name });
+        results.push({
+          server: s.name,
+          url: stream.sources[0]?.url || null,
+          isM3U8: stream.sources[0]?.isM3U8 ?? false,
         });
-
-        if (serverElement.length === 0) {
-          throw new Error(`Server "${serverName}" not found`);
-        }
-
-        const serverId = serverElement.attr('data-id');
-        if (!serverId) {
-          throw new Error(`No source ID found for server "${serverName}"`);
-        }
-
-        const { data: sourceData } = await this.client.get(`${this.baseUrl}/ajax/episode/sources/${serverId}`);
-        if (!sourceData || !sourceData.link) {
-          throw new Error(`No source link found for server "${serverName}"`);
-        }
-
-        const embedUrl = sourceData.link;
-        const directSource = await this.extractDirectLinks(embedUrl);
-        
-        return {
-          id: episodeId,
-          server: serverName,
-          ...directSource
-        };
+      } catch (e) {
+        console.error(`[embed] ${s.name} failed for tv ${tvId} ${se}:`, e.message);
       }
-
-      // If no serverName provided, fetch all servers (original behavior)
-      const sources = [];
-      const serverPromises = $('.nav-item a').map(async (i, el) => {
-        const serverId = $(el).attr('data-id');
-        const serverName = $(el).find('span').text();
-        
-        if (serverId) {
-          try {
-            const { data: sourceData } = await this.client.get(`${this.baseUrl}/ajax/episode/sources/${serverId}`);
-            
-            if (sourceData && sourceData.link) {
-              const embedUrl = sourceData.link;
-              try {
-                const directSource = await this.extractDirectLinks(embedUrl);
-                if (directSource) {
-                  sources.push({
-                    server: serverName,
-                    ...directSource
-                  });
-                }
-              } catch (err) {
-                console.error(`Failed to extract direct link from ${serverName}:`, err);
-              }
-            }
-          } catch (err) {
-            console.error(`Failed to fetch source data from server ${serverId}:`, err);
-          }
-        }
-      }).get();
-
-      await Promise.all(serverPromises);
-
-      return {
-        id: episodeId,
-        sources: sources
-      };
-    } catch (err) {
-      console.error('Error in fetchTvEpisodeEmbedLinks:', err);
-      throw new Error(`Failed to fetch episode embed links: ${err.message}`);
     }
+    return { id: episodeId, sources: results };
+  }
+
+  // Audio languages across the dub-capable peachify servers (iron/multi serve
+  // the same title in Original Audio/Hindi/French/... variants). Lets the audio
+  // dropdown offer a language even when the current server has only one track.
+  async fetchDubs(episodeId, mediaId) {
+    const [type, id] = mediaId.split('/');
+    if (!type || !id) throw new Error('mediaId must be movie/{id} or tv/{id}');
+
+    let season = 1;
+    let episode = 1;
+    if (type === 'tv') {
+      const m = String(episodeId || '').match(/^(?:s)?(\d+)(?:e|[-/])(\d+)$/i);
+      if (m) {
+        season = m[1];
+        episode = m[2];
+      } else if (episodeId.includes('-')) {
+        [season, episode] = episodeId.split('-');
+      }
+    }
+
+    const out = {};
+    await Promise.all(
+      ['iron', 'multi'].map(async (server) => {
+        try {
+          const res = await resolveStream({ type, id, season, episode, server });
+          out[server] = [...new Set(res.sources.map((s) => s.dub).filter(Boolean))];
+        } catch (e) {
+          out[server] = [];
+        }
+      })
+    );
+    return out;
+  }
+
+  // ---- listings ----
+
+  async fetchRecentMovies() {
+    const { data } = await this.tmdb.get('/movie/now_playing');
+    return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+  }
+
+  async fetchRecentTvShows() {
+    const { data } = await this.tmdb.get('/tv/on_the_air');
+    return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+  }
+
+  async fetchTrendingMovies() {
+    const { data } = await this.tmdb.get('/trending/movie/week');
+    return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+  }
+
+  async fetchTrendingTvShows() {
+    const { data } = await this.tmdb.get('/trending/tv/week');
+    return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+  }
+
+  async fetchMoviesByPage(page = 1) {
+    return this._discover('movie', page);
+  }
+
+  async fetchTvShowsByPage(page = 1) {
+    return this._discover('tv', page);
+  }
+
+  async fetchByGenre(genre, page = 1) {
+    const genres = await this._genres();
+    const id = genres[String(genre).toLowerCase()];
+    if (!id) throw new Error(`Genre '${genre}' not found`);
+    return this._discover('movie', page, { with_genres: id });
+  }
+
+  async fetchTopIMDB(type = 'all', page = 1) {
+    if (type === 'all') {
+      // merge movie + tv pages (page 1 of each)
+      const [movies, tv] = await Promise.all([
+        this._discover('movie', 1, { sort_by: 'vote_average.desc', 'vote_count.gte': 500 }),
+        this._discover('tv', 1, { sort_by: 'vote_average.desc', 'vote_count.gte': 500 }),
+      ]);
+      return {
+        currentPage: page,
+        hasNextPage: false,
+        results: [...movies.results, ...tv.results].sort((a, b) => (b.rating || 0) - (a.rating || 0)).slice(0, 40),
+      };
+    }
+    if (type !== 'movie' && type !== 'tv') throw new Error("type must be 'movie', 'tv' or 'all'");
+    return this._discover(type, page, { sort_by: 'vote_average.desc', 'vote_count.gte': 500 });
   }
 }
 
-module.exports = FlixHQ; 
+module.exports = FlixHQ;

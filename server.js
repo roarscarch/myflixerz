@@ -1,4 +1,5 @@
 const express = require('express');
+const path = require('path');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const FlixHQ = require('./flixhq');
@@ -6,14 +7,17 @@ const FlixHQ = require('./flixhq');
 const app = express();
 const flixhq = new FlixHQ();
 
-// Rate limiting
+// Rate limiting — API metadata calls only. Static files and /play (which
+// streams HLS segments — hundreds per movie) must never count against it.
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  skip: (req) => req.path.startsWith('/play'),
 });
 
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(limiter);
 
 // Add request logging middleware
@@ -106,6 +110,21 @@ app.get('/servers/:episodeId', async (req, res) => {
       return res.status(404).json({ error: 'No servers found' });
     }
     res.json(servers);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Audio languages across dub-capable servers (populates the audio dropdown)
+app.get('/dubs/:episodeId', async (req, res) => {
+  try {
+    const { episodeId } = req.params;
+    const { mediaId } = req.query;
+    if (!mediaId) {
+      return res.status(400).json({ error: 'mediaId query parameter is required' });
+    }
+    const dubs = await flixhq.fetchDubs(episodeId, mediaId);
+    res.json(dubs);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -247,8 +266,8 @@ app.get('/tv/embed/:episodeId/server', async (req, res) => {
     const { server } = req.query;
 
     if (!server) {
-      return res.status(400).json({ 
-        error: 'Server parameter is required' 
+      return res.status(400).json({
+        error: 'Server parameter is required'
       });
     }
 
@@ -256,13 +275,101 @@ app.get('/tv/embed/:episodeId/server', async (req, res) => {
     res.json(source);
   } catch (err) {
     console.error('Error in TV episode server endpoint:', err);
-    res.status(err.message.includes('not found') ? 404 : 500).json({ 
-      error: err.message 
+    res.status(err.message.includes('not found') ? 404 : 500).json({
+      error: err.message
     });
   }
+});
+
+// ---- stream pass-through proxy ----
+// Some source CDNs enforce a Referer or lack CORS for foreign origins. This
+// endpoint fetches server-side (with the embed site's referer) and streams back
+// with CORS + Range support, rewriting relative HLS segment URLs so the whole
+// playlist plays through us. Direct-play URLs (x.eat-peach.sbs proxies) are
+// CORS-open and skip this.
+const STREAM_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+app.get('/play', async (req, res) => {
+  const { url, ref } = req.query;
+  if (!url) return res.status(400).json({ error: 'url query parameter is required' });
+  const referer = ref || 'https://peachify.top/';
+  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Invalid url' });
+
+  try {
+    const range = req.headers.range;
+    const upstream = await fetch(url, {
+      headers: {
+        Referer: referer,
+        'User-Agent': STREAM_UA,
+        ...(range ? { Range: range } : {}),
+      },
+    });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(upstream.status).json({ error: `Upstream ${upstream.status}` });
+    }
+
+    const ct = upstream.headers.get('content-type') || 'application/octet-stream';
+    res.set({
+      'Access-Control-Allow-Origin': '*',
+      'Content-Type': ct,
+      'Cache-Control': 'no-store',
+    });
+    if (upstream.headers.get('content-range')) res.set('Content-Range', upstream.headers.get('content-range'));
+
+    if (ct.includes('mpegurl') || ct.includes('m3u8')) {
+      // Rewrite every media URL in the playlist to go through /play:
+      //  - bare relative lines (segment .ts, level .m3u8)
+      //  - URI="..." inside #EXT-X-MEDIA lines (audio/subtitle groups)
+      //  - absolute URLs too (they need our referer header; the browser's
+      //    referer would be our origin, which CDNs may reject)
+      const text = await upstream.text();
+      const toPlay = (u) => {
+        try {
+          const abs = new URL(u, url).href;
+          return `/play?ref=${encodeURIComponent(referer)}&url=${encodeURIComponent(abs)}`;
+        } catch (e) {
+          return null;
+        }
+      };
+      const rewritten = text
+        .split('\n')
+        .map((line) => {
+          const t = line.trim();
+          if (!t) return line;
+          if (t.startsWith('#')) {
+            if (t.startsWith('#EXT-X-MEDIA')) {
+              return line.replace(/URI="([^"]+)"/g, (m, u) => {
+                const r = toPlay(u);
+                return r ? `URI="${r}"` : m;
+              });
+            }
+            return line;
+          }
+          return toPlay(t) || line;
+        })
+        .join('\n');
+      res.send(rewritten);
+    } else {
+      // mp4 / segments / subtitles: stream through
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (range) res.status(206);
+      res.send(buf);
+    }
+  } catch (e) {
+    res.status(502).json({ error: `Proxy error: ${e.message}` });
+  }
+});
+
+// SPA fallback: unknown GETs serve the frontend
+app.use((req, res, next) => {
+  if (req.method === 'GET' && !req.path.startsWith('/api')) {
+    return res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  }
+  next();
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-}); 
+});
