@@ -4,6 +4,35 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { Readable } = require('stream');
 const { spawn } = require('child_process');
+
+// Bounded cache for proxied media segments: HLS fragments (2-10s of video,
+// usually 0.5-4MB) re-fetched on seek-back hit here instead of the upstream.
+// Big files (mp4) exceed MAX_ITEM and never enter it, so streaming a 2GB movie
+// still costs constant memory. 5-min TTL — tokenized URLs expire upstream.
+const SEGMENT_CACHE = new Map(); // req.originalUrl → { data, type, ts }
+const SEGMENT_CACHE_BUDGET = 25 * 1024 * 1024;
+const SEGMENT_CACHE_MAX_ITEM = 4 * 1024 * 1024;
+const SEGMENT_CACHE_TTL = 5 * 60 * 1000;
+let segmentCacheBytes = 0;
+function cacheSegment(key, data, type) {
+  if (data.length > SEGMENT_CACHE_MAX_ITEM) return;
+  if (SEGMENT_CACHE.has(key)) segmentCacheBytes -= SEGMENT_CACHE.get(key).data.length;
+  while (SEGMENT_CACHE.size && segmentCacheBytes + data.length > SEGMENT_CACHE_BUDGET) {
+    let oldestKey = null;
+    let oldestTs = Infinity;
+    for (const [k, v] of SEGMENT_CACHE) {
+      if (v.ts < oldestTs) {
+        oldestTs = v.ts;
+        oldestKey = k;
+      }
+    }
+    if (!oldestKey) break;
+    segmentCacheBytes -= SEGMENT_CACHE.get(oldestKey).data.length;
+    SEGMENT_CACHE.delete(oldestKey);
+  }
+  SEGMENT_CACHE.set(key, { data, type, ts: Date.now() });
+  segmentCacheBytes += data.length;
+}
 const FlixHQ = require('./flixhq');
 
 const app = express();
@@ -364,6 +393,20 @@ app.get('/play', async (req, res) => {
     } else {
       // mp4 / segments / subtitles: stream through (piped, constant memory —
       // buffering a 2GB movie into RAM would OOM a small server)
+      const range = req.headers.range;
+      // HLS segments are fetched without Range — serve cached copies locally
+      // (seek-back becomes instant, no upstream round-trip)
+      if (!range) {
+        const hit = SEGMENT_CACHE.get(req.originalUrl);
+        if (hit && Date.now() - hit.ts < SEGMENT_CACHE_TTL) {
+          return res.set({
+            'Content-Type': hit.type,
+            'Content-Length': hit.data.length,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store',
+          }).send(hit.data);
+        }
+      }
       if (upstream.status === 206) res.status(206);
       const cl = upstream.headers.get('content-length');
       if (cl) res.set('Content-Length', cl);
@@ -374,6 +417,21 @@ app.get('/play', async (req, res) => {
           reject(e);
         });
         res.on('close', resolve); // normal finish or client abort — either way done
+        // tee small un-ranged responses (segments) into the cache as they flow
+        if (!range && cl && Number(cl) > 0 && Number(cl) <= SEGMENT_CACHE_MAX_ITEM) {
+          const chunks = [];
+          let total = 0;
+          body.on('data', (c) => {
+            total += c.length;
+            if (total <= SEGMENT_CACHE_MAX_ITEM) chunks.push(c);
+            else chunks.length = 0; // grew past the cap — stop caching
+          });
+          body.on('end', () => {
+            if (chunks.length && total <= SEGMENT_CACHE_MAX_ITEM) {
+              cacheSegment(req.originalUrl, Buffer.concat(chunks), ct);
+            }
+          });
+        }
         body.pipe(res);
       });
     }

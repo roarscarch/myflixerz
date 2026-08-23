@@ -188,6 +188,24 @@ are always exempt (`/play` can be called hundreds of times per movie; one
 download can stream for an hour). Static files are served before the limiter
 and never count.
 
+**Response caching** (in-memory, in-flight deduped — concurrent identical
+calls share one upstream fetch, rejected promises evict themselves):
+
+| Data | TTL | Why |
+|---|---|---|
+| search | 5 min | repeat/back-navigation is instant |
+| listings (recent/trending/discover/genre/top-imdb) | 10 min | browse pages barely change minute-to-minute |
+| info (+ all episode lists) | 15 min | the slowest endpoint (TV = one TMDB call **per season**, now parallel) |
+| dubs | 10 min | title-level, rarely changes |
+| sources | 60 s | server-button churn on the watch page is instant; tokenized URLs expire too fast for longer |
+
+Warm responses return in **~1 ms** (cold is 0.4–2.5 s, TMDB/upstream-bound).
+
+**Segment cache** in `/play` (25 MB budget, items ≤ 4 MB, 5 min TTL):
+HLS fragments stream through *and* into the cache, so seek-back skips the
+upstream round-trip (measured: 2.7 s → 0.22 s). Big mp4s never enter it —
+streaming a 2 GB movie still costs constant memory.
+
 ---
 
 ## 6. Embed families (the core)
@@ -327,6 +345,7 @@ new hosts default to the proxy, which is the safe choice.
 | Resume + Continue Watching | Position saved to **`myflixerz-progress`** (per `mediaId/episodeId`, throttled to 5s, removed when the title ends). On reload the player seeks back automatically ("Resumed from 1:30" toast); the home page shows a "⏯️ Continue Watching" row with per-title progress bars, jumping straight into the right episode. |
 | Keyboard shortcuts | `space`/`k` play-pause · `→`/`l` +10s · `←`/`j` −10s · `↑`/`↓` volume · `m` mute · `f` fullscreen · `>`/`.` speed up · `<`/`,` speed down (ignored while typing). |
 | Speed + PiP | Toolbar buttons: speed cycles 0.25× increments (clamped 0.25–2×), PiP button hidden when unsupported. |
+| First paint | Google Fonts load **async** (never block first paint — fallback text shows instantly, `display=swap` swaps in the font); hls.js (~400 KB) is **lazy-loaded only on watch pages** (browse/search never parse it); home-page rows fetch **in parallel** (was 4 sequential round-trips; now one batch — full home renders in ~130 ms warm). |
 | Download | Toolbar button saves whatever is currently playing. Direct sources stream through `/download` with an `attachment` header; HLS gets remuxed to `.mp4` by server-side ffmpeg (`-c:v copy`, no re-encode). Filename comes from the title. Requires ffmpeg on PATH for HLS. |
 | Skip intro | `api.theintrodb.org` lookup. |
 

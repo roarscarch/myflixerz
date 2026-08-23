@@ -69,6 +69,12 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
 - Tests: `npm test` (node --test) — `tests/extractor.test.js` guards the
   decoders with self-generated fixtures. Keep it green; extend it when the
   cipher or a response shape changes.
+- Caching invariants: TTLs live in `flixhq.js._cached` (search 5 min, listings
+  10 min, info 15 min, dubs 10 min, sources 60 s). Sources cache must stay
+  SHORT — tokenized stream URLs expire upstream. `/play` segment cache
+  (`SEGMENT_CACHE` in server.js): items ≤ 4 MB, budget 25 MB, 5 min TTL;
+  never raise the item cap (constant-memory streaming is the point) and never
+  cache ranged responses (only whole-fragment requests).
 - `/health` must stay defined BEFORE the limiter (probes must not count).
 - `/download`: direct sources proxy with `Content-Disposition: attachment`;
   `hls=1` spawns ffmpeg (`-c:v copy -c:a aac -movflags frag_keyframe+empty_moov`
@@ -76,6 +82,10 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
   kill the ffmpeg child (orphaned ffmpeg = disk/CPU leak). Without ffmpeg the
   HLS path 503s with a hint — that is intended behavior, not a bug. Both
   `/play` and `/download` are exempt from the rate limiter.
+- Frontend perf invariants: Google Fonts link must stay `media="print" onload`
+  (render-blocking fonts delay first paint); hls.js must stay lazy-loaded in
+  `loadHls()` (watch view only — do NOT re-add the script tag to index.html);
+  home-page sections must stay in one `Promise.all` batch.
 - The service worker (`public/sw.js`) must NEVER cache `/play` or API paths
   (tokenized URLs, Range requests) — `NETWORK_ONLY` regex guards that.
 - PWA paths: the `NETWORK_ONLY` regex also covers `/download` — same reason.

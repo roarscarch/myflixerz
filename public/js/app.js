@@ -23,6 +23,26 @@
     toast._t = setTimeout(() => (toast.hidden = true), 2600);
   }
 
+  // hls.js (~400KB) loads only when a watch page opens; browse/search pages
+  // never pay for it. Cached by the service worker after first use.
+  let hlsPromise = null;
+  function loadHls() {
+    if (window.Hls) return Promise.resolve();
+    if (!hlsPromise) {
+      hlsPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js';
+        s.onload = () => resolve();
+        s.onerror = () => {
+          hlsPromise = null; // allow retry
+          reject(new Error('hls.js failed to load'));
+        };
+        document.head.appendChild(s);
+      });
+    }
+    return hlsPromise;
+  }
+
   function scrollTop() {
     window.scrollTo({ top: 0 });
   }
@@ -268,21 +288,28 @@
       ['/recent/movies', 'now-playing'],
       ['/top-imdb?type=all', 'top-rated'],
     ];
-    for (let i = 0; i < sections.length; i++) {
-      const [ep] = sections[i];
-      try {
-        const data = await API.get(ep);
-        const items = Array.isArray(data) ? data : data.results || [];
-        const sectionEl = view.querySelectorAll('.section[data-row]')[i];
-        sectionEl.querySelector('.row-wrap').outerHTML = rowWithArrows(
-          items.slice(0, 14).map((i) => card(i).outerHTML).join('')
-        );
-        bindRowArrows(view);
-        bindCards(view);
-      } catch (e) {
-        console.warn(ep, e);
-      }
-    }
+    // all four rows fetch in parallel (was sequential: 4 round-trips in a row);
+    // one failure degrades to an empty row instead of stalling the rest
+    const results = await Promise.all(
+      sections.map(async ([ep]) => {
+        try {
+          const data = await API.get(ep);
+          return Array.isArray(data) ? data : data.results || [];
+        } catch (e) {
+          console.warn(ep, e);
+          return [];
+        }
+      })
+    );
+    sections.forEach(([, sel], i) => {
+      const items = results[i];
+      const sectionEl = view.querySelectorAll('.section[data-row]')[i];
+      sectionEl.querySelector('.row-wrap').outerHTML = rowWithArrows(
+        items.slice(0, 14).map((c) => card(c).outerHTML).join('')
+      );
+      bindRowArrows(view);
+      bindCards(view);
+    });
   };
 
   // ---- browse ----
@@ -570,7 +597,8 @@
       );
     } catch (e) {}
 
-    // player
+    // player (hls.js lazy-loaded — only the watch page needs it)
+    await loadHls().catch(() => {});
     const shell = view.querySelector('.player-shell');
     const player = new Player.MoviePlayer(shell);
     const subsSelect = view.querySelector('#subsSelect');

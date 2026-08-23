@@ -18,9 +18,40 @@ class FlixHQ {
     this.baseUrl = 'https://myflixerfree.to';
     this.tmdb = axios.create({ baseURL: TMDB_BASE, params: { api_key: TMDB_API_KEY } });
     this._genresCache = null;
+    this._cache = new Map(); // { key → { exp, promise } } TTL cache, in-flight dedupe
   }
 
   // ---- helpers ----
+
+  /**
+   * TTL cache with in-flight dedupe: concurrent identical calls share one
+   * upstream fetch; repeat calls within ttlMs resolve instantly. Rejected
+   * promises evict themselves so errors don't get stuck in the cache.
+   */
+  _cached(key, ttlMs, fn) {
+    const now = Date.now();
+    const hit = this._cache.get(key);
+    if (hit) {
+      if (hit.exp > now) return hit.promise;
+      this._cache.delete(key);
+    }
+    const p = Promise.resolve()
+      .then(fn)
+      .then((v) => {
+        this._cache.set(key, { exp: Date.now() + ttlMs, promise: Promise.resolve(v) });
+        return v;
+      })
+      .catch((e) => {
+        this._cache.delete(key);
+        throw e;
+      });
+    this._cache.set(key, { exp: now + ttlMs, promise: p });
+    if (this._cache.size > 600) {
+      const t = Date.now();
+      for (const [k, v] of this._cache) if (v.exp < t) this._cache.delete(k);
+    }
+    return p;
+  }
 
   _img(path) {
     return path ? `${IMAGE_BASE}${path}` : null;
@@ -63,65 +94,84 @@ class FlixHQ {
   }
 
   async _discover(type, page, extra = {}) {
-    const { data } = await this.tmdb.get(`/discover/${type}`, {
-      params: { page, sort_by: 'popularity.desc', ...extra },
+    // 10 min TTL — browse pages rarely change minute-to-minute
+    const key = `discover:${type}:${page}:${JSON.stringify(extra)}`;
+    return this._cached(key, 10 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get(`/discover/${type}`, {
+        params: { page, sort_by: 'popularity.desc', ...extra },
+      });
+      return {
+        currentPage: data.page,
+        hasNextPage: data.page < data.total_pages,
+        results: data.results.map((r) => this._item(type, r, type)),
+      };
     });
-    return {
-      currentPage: data.page,
-      hasNextPage: data.page < data.total_pages,
-      results: data.results.map((r) => this._item(type, r, type)),
-    };
   }
 
   // ---- search ----
 
   async search(query, page = 1) {
-    const { data } = await this.tmdb.get('/search/multi', {
-      params: { query, page, include_adult: 'false' },
+    // 5 min TTL — search feels instant on repeat/back-navigation
+    return this._cached(`search:${query}:${page}`, 5 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get('/search/multi', {
+        params: { query, page, include_adult: 'false' },
+      });
+      const results = data.results
+        .filter((r) => r.media_type === 'movie' || r.media_type === 'tv')
+        .map((r) => this._item(r.media_type, r, r.media_type));
+      return { currentPage: data.page, hasNextPage: data.page < data.total_pages, results };
     });
-    const results = data.results
-      .filter((r) => r.media_type === 'movie' || r.media_type === 'tv')
-      .map((r) => this._item(r.media_type, r, r.media_type));
-    return { currentPage: data.page, hasNextPage: data.page < data.total_pages, results };
   }
 
   // ---- media info ----
 
   async fetchMediaInfo(mediaId) {
-    const [type, id] = mediaId.split('/');
-    if (type !== 'movie' && type !== 'tv') throw new Error('Invalid media ID format');
+    // 15 min TTL — info pages + their episode lists are the slowest endpoint
+    // (TV does one request per season); caching makes repeat visits instant.
+    return this._cached(`info:${mediaId}`, 15 * 60 * 1000, async () => {
+      const [type, id] = mediaId.split('/');
+      if (type !== 'movie' && type !== 'tv') throw new Error('Invalid media ID format');
 
-    const { data } = await this.tmdb.get(`/${type}/${id}`, {
-      params: { append_to_response: 'credits,recommendations,videos' },
-    });
+      const { data } = await this.tmdb.get(`/${type}/${id}`, {
+        params: { append_to_response: 'credits,recommendations,videos' },
+      });
 
-    const title = data.title || data.name;
-    const info = {
-      id: `${type}/${data.id}`,
-      title,
-      url: this._playerUrl(type, data.id, title),
-      cover: this._img(data.backdrop_path),
-      image: this._img(data.poster_path),
-      description: data.overview,
-      type: type === 'movie' ? TvType.MOVIE : TvType.TVSERIES,
-      releaseDate: data.release_date || data.first_air_date,
-      genres: (data.genres || []).map((g) => g.name),
-      casts: (data.credits?.cast || []).slice(0, 15).map((c) => c.name),
-      production: (data.production_companies || []).slice(0, 3).map((c) => c.name),
-      country: (data.production_countries || []).map((c) => c.name),
-      duration: type === 'movie' ? `${data.runtime || 0} min` : undefined,
-      rating: data.vote_average || 0,
-      recommendations: (data.recommendations?.results || []).slice(0, 12).map((r) => this._item(type, r, type)),
-    };
+      const title = data.title || data.name;
+      const info = {
+        id: `${type}/${data.id}`,
+        title,
+        url: this._playerUrl(type, data.id, title),
+        cover: this._img(data.backdrop_path),
+        image: this._img(data.poster_path),
+        description: data.overview,
+        type: type === 'movie' ? TvType.MOVIE : TvType.TVSERIES,
+        releaseDate: data.release_date || data.first_air_date,
+        genres: (data.genres || []).map((g) => g.name),
+        casts: (data.credits?.cast || []).slice(0, 15).map((c) => c.name),
+        production: (data.production_companies || []).slice(0, 3).map((c) => c.name),
+        country: (data.production_countries || []).map((c) => c.name),
+        duration: type === 'movie' ? `${data.runtime || 0} min` : undefined,
+        rating: data.vote_average || 0,
+        recommendations: (data.recommendations?.results || []).slice(0, 12).map((r) => this._item(type, r, type)),
+      };
 
-    // episodes for TV
-    if (type === 'tv') {
-      info.episodes = [];
-      const seasonCount = Math.min(data.number_of_seasons || 0, 10);
-      for (let s = 1; s <= seasonCount; s++) {
-        try {
-          const { data: seasonData } = await this.tmdb.get(`/tv/${id}/season/${s}`);
-          for (const ep of seasonData.episodes || []) {
+      // episodes for TV — ALL seasons fetched in parallel (was sequential:
+      // 8 seasons = 8 round-trips ≈ 2.5s; now ≈ one round-trip)
+      if (type === 'tv') {
+        const seasonCount = Math.min(data.number_of_seasons || 0, 10);
+        const seasonResults = await Promise.all(
+          Array.from({ length: seasonCount }, (_, i) =>
+            this.tmdb
+              .get(`/tv/${id}/season/${i + 1}`)
+              .then((r) => r.data.episodes || [])
+              .catch(() => null) // season with no episodes — skip, keep the rest
+          )
+        );
+        info.episodes = [];
+        seasonResults.forEach((eps, i) => {
+          if (!eps) return;
+          const s = i + 1;
+          for (const ep of eps) {
             info.episodes.push({
               id: `${s}-${ep.episode_number}`,
               title: ep.name,
@@ -130,15 +180,13 @@ class FlixHQ {
               url: this._playerUrl('tv', data.id, title, s, ep.episode_number),
             });
           }
-        } catch (e) {
-          break; // season has no episodes
-        }
+        });
+      } else {
+        info.episodes = [{ id, title, number: 1, season: 1, url: this._playerUrl('movie', data.id, title) }];
       }
-    } else {
-      info.episodes = [{ id, title, number: 1, season: 1, url: this._playerUrl('movie', data.id, title) }];
-    }
 
-    return info;
+      return info;
+    });
   }
 
   // ---- servers & sources ----
@@ -148,6 +196,14 @@ class FlixHQ {
   }
 
   async fetchEpisodeSources(episodeId, mediaId, server = null) {
+    // 60s TTL: server-button churn on the watch page is instant, while token
+    // expiries are still too short for anything longer. resolveStream already
+    // negative-caches dead providers, so a stale hit that 404s just falls
+    // through to the auto-cycle.
+    return this._cached(`sources:${episodeId}:${mediaId}:${server || 'auto'}`, 60 * 1000, () => this._episodeSources(episodeId, mediaId, server));
+  }
+
+  async _episodeSources(episodeId, mediaId, server = null) {
     const [type, id] = mediaId.split('/');
     if (!type || !id) throw new Error('mediaId must be movie/{id} or tv/{id}');
 
@@ -237,6 +293,11 @@ class FlixHQ {
   // the same title in Original Audio/Hindi/French/... variants). Lets the audio
   // dropdown offer a language even when the current server has only one track.
   async fetchDubs(episodeId, mediaId) {
+    // 10 min TTL — the dub list is title-level, doesn't change often
+    return this._cached(`dubs:${episodeId}:${mediaId}`, 10 * 60 * 1000, () => this._fetchDubs(episodeId, mediaId));
+  }
+
+  async _fetchDubs(episodeId, mediaId) {
     const [type, id] = mediaId.split('/');
     if (!type || !id) throw new Error('mediaId must be movie/{id} or tv/{id}');
 
@@ -269,23 +330,32 @@ class FlixHQ {
   // ---- listings ----
 
   async fetchRecentMovies() {
-    const { data } = await this.tmdb.get('/movie/now_playing');
-    return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+    // 10 min TTL — home-page sections resolve instantly on revisit
+    return this._cached('recent:movies', 10 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get('/movie/now_playing');
+      return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+    });
   }
 
   async fetchRecentTvShows() {
-    const { data } = await this.tmdb.get('/tv/on_the_air');
-    return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+    return this._cached('recent:tv', 10 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get('/tv/on_the_air');
+      return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+    });
   }
 
   async fetchTrendingMovies() {
-    const { data } = await this.tmdb.get('/trending/movie/week');
-    return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+    return this._cached('trending:movies', 10 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get('/trending/movie/week');
+      return data.results.slice(0, 20).map((r) => this._item('movie', r, 'movie'));
+    });
   }
 
   async fetchTrendingTvShows() {
-    const { data } = await this.tmdb.get('/trending/tv/week');
-    return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+    return this._cached('trending:tv', 10 * 60 * 1000, async () => {
+      const { data } = await this.tmdb.get('/trending/tv/week');
+      return data.results.slice(0, 20).map((r) => this._item('tv', r, 'tv'));
+    });
   }
 
   async fetchMoviesByPage(page = 1) {
