@@ -1,0 +1,19 @@
+# systemd unit for MyFlixz (no-container option)
+# 1. cp deploy/myflixerz.service ~/.config/systemd/user/  (or /etc/systemd/system/)
+# 2. systemctl daemon-reload && systemctl enable --now myflixerz
+[Unit]
+Description=MyFlixz streaming server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/anur7781/myflixerz
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target

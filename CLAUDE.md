@@ -60,9 +60,18 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
 
 - Stale/duplicate server processes: kill via `pgrep -f 'node server\.js'` +
   `kill` — never `pkill -f "node server"` from the same shell (matches the
-  shell wrapper itself, kills the session).
+  shell wrapper itself, kills the session). If started with an absolute path
+  (`node /path/to/server.js`) the pattern won't match — check `ss -tlnp` and
+  kill by pid.
 - localStorage keys: `myflixerz-quality` (height or 'auto'), `myflixerz-audio`
-  (dub label or 'auto').
+  (dub label or 'auto'), `myflixerz-progress` (per-title resume map — keyed
+  `mediaId/episodeId`; powers resume + Continue Watching row).
+- Tests: `npm test` (node --test) — `tests/extractor.test.js` guards the
+  decoders with self-generated fixtures. Keep it green; extend it when the
+  cipher or a response shape changes.
+- `/health` must stay defined BEFORE the limiter (probes must not count).
+- The service worker (`public/sw.js`) must NEVER cache `/play` or API paths
+  (tokenized URLs, Range requests) — `NETWORK_ONLY` regex guards that.
 - Peachify CDN flakiness (502s) is upstream; Auto mode + vidnest fallback is
   the mitigation, not new code.
 - Server log: `/tmp/flixhq_server.log` when started with nohup.

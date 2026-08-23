@@ -29,7 +29,7 @@
 
   function card(item) {
     const [type] = String(item.id || '').split('/');
-    const url = `#/${type}/${item.id.split('/')[1]}`;
+    const url = item.href || `#/${type}/${item.id.split('/')[1]}`;
     const year = item.releaseDate || item.year || '';
     const badge = type === 'tv' ? 'tv' : 'movie';
     return el(`
@@ -37,16 +37,49 @@
         <div class="poster-wrap">
           <span class="card-badge ${badge}">${TYPE_LABEL[type] || ''}</span>
           ${item.image ? `<img src="${item.image}" alt="${escapeHtml(item.title)}" loading="lazy" />` : ''}
+          ${item.progress ? `<div class="card-progress"><i style="width:${item.progress}%"></i></div>` : ''}
           <div class="card-hover">
             <div class="ch-title">${escapeHtml(item.title)}</div>
             <div class="ch-meta">${year ? year + ' · ' : ''}${TYPE_LABEL[type] || ''}</div>
-            <span class="ch-play">▶ Watch now</span>
+            <span class="ch-play">${item.progress ? '▶ Continue' : '▶ Watch now'}</span>
           </div>
         </div>
         <div class="card-title">${escapeHtml(item.title)}</div>
         <div class="card-year">${year}</div>
       </div>
     `);
+  }
+
+  // ---- continue watching (from saved watch positions) ----
+  function fmtTime(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function continueWatchingItems() {
+    try {
+      const map = JSON.parse(localStorage.getItem('myflixerz-progress') || '{}');
+      return Object.entries(map)
+        .filter(([, e]) => e.pos > 30 && (!e.dur || e.dur - e.pos > 15))
+        .map(([key, e]) => {
+          const [type, id] = key.split('/');
+          return {
+            id: `${type}/${id}`,
+            href: type === 'tv' ? `#/watch/${type}/${id}/${e.episodeId || '1-1'}` : `#/watch/${type}/${id}`,
+            title: e.title || 'Continue watching',
+            image: e.image || '',
+            releaseDate: '',
+            type,
+            progress: e.dur ? Math.round((e.pos / e.dur) * 100) : 0,
+            _t: e.t || 0,
+          };
+        })
+        .sort((a, b) => b._t - a._t)
+        .slice(0, 10);
+    } catch (e) {
+      return [];
+    }
   }
 
   function escapeHtml(s) {
@@ -187,19 +220,23 @@
           <button id="heroSearchBtn">Search</button>
         </div>
       </section>
-      <section class="section">
+      <section class="section" id="cwSection" hidden>
+        <div class="section-head"><h2>⏯️ Continue Watching</h2></div>
+        ${rowWithArrows('')}
+      </section>
+      <section class="section" data-row>
         <div class="section-head"><h2>🔥 Trending Movies</h2><a class="see-all" href="#/movies">See all</a></div>
         ${rowWithArrows(skeletonRow())}
       </section>
-      <section class="section">
+      <section class="section" data-row>
         <div class="section-head"><h2>📺 Trending TV Shows</h2><a class="see-all" href="#/tv-shows">See all</a></div>
         ${rowWithArrows(skeletonRow())}
       </section>
-      <section class="section">
+      <section class="section" data-row>
         <div class="section-head"><h2>🆕 Now Playing</h2><a class="see-all" href="#/movies">See all</a></div>
         ${rowWithArrows(skeletonRow())}
       </section>
-      <section class="section">
+      <section class="section" data-row>
         <div class="section-head"><h2>⭐ Top Rated</h2><a class="see-all" href="#/top-rated">See all</a></div>
         ${rowWithArrows(skeletonRow())}
       </section>`;
@@ -213,6 +250,18 @@
     heroInput.addEventListener('keydown', (e) => e.key === 'Enter' && go());
     heroInput.addEventListener('input', () => runSearch(heroInput.value));
 
+    // Continue Watching row from saved positions (hidden when nothing is in progress)
+    const cwItems = continueWatchingItems();
+    if (cwItems.length) {
+      const cw = view.querySelector('#cwSection');
+      cw.hidden = false;
+      cw.querySelector('.row-wrap').outerHTML = rowWithArrows(
+        cwItems.map((i) => card(i).outerHTML).join('')
+      );
+      bindRowArrows(view);
+      bindCards(view);
+    }
+
     const sections = [
       ['/trending/movies', 'trending-movies'],
       ['/trending/tv', 'trending-tv'],
@@ -224,7 +273,7 @@
       try {
         const data = await API.get(ep);
         const items = Array.isArray(data) ? data : data.results || [];
-        const sectionEl = view.querySelectorAll('.section')[i];
+        const sectionEl = view.querySelectorAll('.section[data-row]')[i];
         sectionEl.querySelector('.row-wrap').outerHTML = rowWithArrows(
           items.slice(0, 14).map((i) => card(i).outerHTML).join('')
         );
@@ -495,6 +544,8 @@
           <select class="subs-select" id="subsSelect">
             <option value="">Subtitles: Off</option>
           </select>
+          <button class="subs-select ctl-btn" id="speedBtn" title="Playback speed (shortcuts: > / <)">Speed: 1x</button>
+          <button class="subs-select ctl-btn" id="pipBtn" title="Picture in picture">⧉ PiP</button>
           <span class="sub" id="providerInfo"></span>
         </div>
       </div>`;
@@ -522,6 +573,20 @@
     const shell = view.querySelector('.player-shell');
     const player = new Player.MoviePlayer(shell);
     const subsSelect = view.querySelector('#subsSelect');
+
+    // toolbar: speed + PiP + resume notice
+    const speedBtn = view.querySelector('#speedBtn');
+    const pipBtn = view.querySelector('#pipBtn');
+    if (!document.pictureInPictureEnabled || !document.createElement('video').requestPictureInPicture) {
+      pipBtn.hidden = true;
+    }
+    shell.addEventListener('speed-change', (e) => {
+      const r = Math.round(e.detail.rate * 100) / 100;
+      speedBtn.textContent = `Speed: ${r}x`;
+    });
+    speedBtn.addEventListener('click', () => player.changeSpeed(0.25));
+    pipBtn.addEventListener('click', () => player.togglePip());
+    shell.addEventListener('progress-resumed', (e) => toastMsg(`Resumed from ${fmtTime(e.detail.pos)}`));
     shell.addEventListener('sources-ready', (e) => {
       const labels = Player.PROVIDER_LABELS;
       const p = e.detail.provider;
@@ -622,7 +687,7 @@
         levels.map((h) => `<option value="${h}">${h}p</option>`).join('');
       qualitySelect.value = levels.includes(String(player.quality)) ? player.quality : 'auto';
     });
-    player.load({ mediaId, episodeId, title });
+    player.load({ mediaId, episodeId, title, image: info ? info.image : '' });
   };
 
   // ---------------- router ----------------

@@ -1,0 +1,19 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# install deps first (better layer caching)
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# app code
+COPY server.js flixhq.js extractor.js models.js ./
+COPY public ./public
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+EXPOSE 3000
+
+# handle SIGTERM cleanly so container orchestration stops us politely
+CMD ["node", "server.js"]

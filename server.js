@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const { Readable } = require('stream');
 const FlixHQ = require('./flixhq');
 
 const app = express();
@@ -17,6 +18,13 @@ const limiter = rateLimit({
 
 app.use(cors());
 app.use(express.json());
+
+// Health check for container orchestration — defined before the limiter so
+// probes never count against the API quota.
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: Math.round(process.uptime()), ts: Date.now() });
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(limiter);
 
@@ -351,10 +359,20 @@ app.get('/play', async (req, res) => {
         .join('\n');
       res.send(rewritten);
     } else {
-      // mp4 / segments / subtitles: stream through
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      if (range) res.status(206);
-      res.send(buf);
+      // mp4 / segments / subtitles: stream through (piped, constant memory —
+      // buffering a 2GB movie into RAM would OOM a small server)
+      if (upstream.status === 206) res.status(206);
+      const cl = upstream.headers.get('content-length');
+      if (cl) res.set('Content-Length', cl);
+      await new Promise((resolve, reject) => {
+        const body = Readable.fromWeb(upstream.body);
+        body.on('error', (e) => {
+          res.destroy();
+          reject(e);
+        });
+        res.on('close', resolve); // normal finish or client abort — either way done
+        body.pipe(res);
+      });
     }
   } catch (e) {
     res.status(502).json({ error: `Proxy error: ${e.message}` });

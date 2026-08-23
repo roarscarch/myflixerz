@@ -1,0 +1,11 @@
+services:
+  myflixerz:
+    build: .
+    container_name: myflixerz
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      # optional: override the public TMDB key baked into flixhq.js
+      - TMDB_API_KEY=${TMDB_API_KEY:-}

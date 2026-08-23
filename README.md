@@ -175,6 +175,7 @@ All routes serve JSON. `episodeId` = `{season}-{episode}` for TV
 | `GET /movie/embed/:movieId` | `server?` | every server's raw source URL + `isM3U8` |
 | `GET /tv/embed/:episodeId` | `server?` | same for TV (`episodeId` = `tvId:s-e`) |
 | `GET /play` | `url`, `ref?` | **stream pass-through proxy** (not JSON) |
+| `GET /health` | — | `{ok, uptime}` for container orchestration (before the limiter) |
 | `GET /` (fallback) | — | `public/index.html` |
 
 Rate limit: **600 requests / 15 min** on API routes. `/play` is always exempt
@@ -313,11 +314,22 @@ new hosts default to the proxy, which is the safe choice.
 | Feature | How it works |
 |---|---|
 | Server buttons | `GET /servers/...` lists the 10 names; "Auto" (default) lets the backend pick. Clicking a server reloads sources for it only. |
-| Auto-fallback | `player.js` keeps `_triedServers`; if a server fails mid-play it auto-advances in `SERVER_FALLBACK_ORDER = ['videasy','hollymoviehd','rogflix','buzz','ngc','horizon','wolf','spider','multi','iron']`, bounded by the tried list. |
+| Auto-fallback | `player.js` keeps `_triedServers`; if a server fails mid-play it auto-advances in `SERVER_FALLBACK_ORDER = ['videasy','hollymoviehd','rogflix','buzz','ngc','horizon','wolf','spider','multi','iron']`, bounded by the tried list. Each failure shows a visible "Server X failed — trying next…" notice (no more silent black screens). |
 | Quality | hls.js levels (`hls.levels` / `hls.currentLevel` by height). Stored as **`myflixerz-quality`** in localStorage (`'auto'` = ABR, or an explicit height). Non-HLS (MP4) sources re-attach with the chosen source. |
 | Audio (dub) | Dropdown is always visible. `collectDubs()` reads the current server's `dub` values, then probes `GET /dubs` once (which checks iron + multi) and merges. Picking a language the current server lacks **auto-switches the server button** to the one that has it. Stored as **`myflixerz-audio`**. |
 | Subtitles | Merged from both subtitle APIs, deduped by label, populated on demand from the sources payload. VTT/SRT both parse. |
+| Resume + Continue Watching | Position saved to **`myflixerz-progress`** (per `mediaId/episodeId`, throttled to 5s, removed when the title ends). On reload the player seeks back automatically ("Resumed from 1:30" toast); the home page shows a "⏯️ Continue Watching" row with per-title progress bars, jumping straight into the right episode. |
+| Keyboard shortcuts | `space`/`k` play-pause · `→`/`l` +10s · `←`/`j` −10s · `↑`/`↓` volume · `m` mute · `f` fullscreen · `>`/`.` speed up · `<`/`,` speed down (ignored while typing). |
+| Speed + PiP | Toolbar buttons: speed cycles 0.25× increments (clamped 0.25–2×), PiP button hidden when unsupported. |
 | Skip intro | `api.theintrodb.org` lookup. |
+
+### PWA
+
+The app is installable: `manifest.webmanifest` (standalone display, theme color)
++ `sw.js` (precaches the shell, network-first navigations with offline fallback,
+cache-first static, **never caches** `/play` or API routes — tokenized URLs and
+Range requests must always reach the server). Register happens on `load` in
+`index.html`. Add to home screen → opens fullscreen like a native app.
 
 ---
 
@@ -402,7 +414,20 @@ features.
 
 ---
 
-## 12. Troubleshooting
+## 12. Tests
+
+```bash
+npm test    # node --test — auto-discovers tests/
+```
+
+`tests/extractor.test.js` covers the fragile parts: the Peachify AES-256-GCM
+round-trip (including auth-tag tamper rejection), the Vidnest custom-base64
+round-trip + alphabet sanity, all three Vidnest response shapes, and
+`toResult` normalization. Fixtures are self-generated from the known key and
+alphabet — no live upstream dependency, runs offline, catches cipher/format
+drift instantly.
+
+## 13. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -413,9 +438,20 @@ features.
 | Audio dropdown empty | No dub-capable provider answered; the API's `/dubs` probe failed for both iron and multi (transient upstream). |
 | 429s | Hitting the 600/15-min API limit — normally only /play is hot, which is exempt. |
 
-## 13. Deployment
+## 14. Deployment
 
-`vercel.json` builds the whole app as a single `@vercel/node` function from
-`server.js`; all routes fall through to it. The rate limiter and `/play` proxy
-work there unchanged. For a VPS: plain `node server.js` behind nginx with
-`proxy_buffering off` for `/play` if you see stutter.
+Three options, same code:
+
+- **Docker (recommended):** `docker compose up -d --build` → port 3000.
+  `Dockerfile` uses `node:20-alpine` + `npm ci --omit=dev`; `TMDB_API_KEY`
+  overridable via env; `restart: unless-stopped`; probe `GET /health`.
+- **systemd:** `deploy/myflixerz.service` — adjust `WorkingDirectory` and
+  `ExecStart`, install under `/etc/systemd/system/`, then
+  `systemctl enable --now myflixerz`.
+- **Vercel:** `vercel.json` builds the whole app as a single `@vercel/node`
+  function from `server.js`; all routes fall through to it. The rate limiter
+  and `/play` proxy work there unchanged.
+
+For a VPS behind nginx: plain `node server.js` with `proxy_buffering off` for
+`/play` if you see stutter. `/play` streams with constant memory (piped, not
+buffered — a 2 GB movie no longer costs 2 GB of RAM).

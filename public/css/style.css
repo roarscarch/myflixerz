@@ -792,3 +792,15 @@ button { font-family: inherit; }
   .episodes { grid-template-columns: 1fr; }
   .row-arrow { display: none !important; }
 }
+
+/* ---- player polish: speed/PiP buttons, progress bars ---- */
+.ctl-btn { cursor: pointer; font: inherit; line-height: 1.2; }
+.ctl-btn:hover { color: var(--text); border-color: var(--accent); }
+.card-progress {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.18);
+  z-index: 2;
+}
+.card-progress i { display: block; height: 100%; background: var(--accent); }

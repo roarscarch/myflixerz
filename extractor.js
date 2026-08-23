@@ -62,6 +62,31 @@ const vidnestCache = new Map();
 const subsCache = new Map();
 const vdrkSubsCache = new Map();
 
+// Dead-provider cache: providers that just failed are skipped for 30s. Dead
+// upstreams are the common case (content-gated 502s, flaky CDNs), so without
+// this every auto-cycle would burn a full timeout on each known-bad provider.
+const DEAD_TTL_MS = 30_000;
+const deadCache = new Map(); // `${family}:${providerName}:${titleKey}` -> expiry ms
+
+function markDead(family, provider, key) {
+  deadCache.set(`${family}:${provider.name}:${key}`, Date.now() + DEAD_TTL_MS);
+}
+
+function isDead(family, provider, key) {
+  return (deadCache.get(`${family}:${provider.name}:${key}`) || 0) > Date.now();
+}
+
+// Bound every upstream request so a hanging CDN can't stall the whole cycle.
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 function titleKey(type, id, season, episode) {
   return type === 'tv' ? `tv/${id}/${season}/${episode}` : `movie/${id}`;
 }
@@ -81,7 +106,11 @@ function decryptPayload(payload) {
 async function fetchProvider(provider, type, id, season, episode) {
   let url = `${PEACHIFY_API}/${provider.path}/${type}/${id}`;
   if (type === 'tv') url += `/${season}/${episode}`;
-  const res = await fetch(url, { headers: { Referer: PEACHIFY_REFERER } });
+  const res = await withTimeout(
+    fetch(url, { headers: { Referer: PEACHIFY_REFERER } }),
+    6000,
+    `peachify ${provider.name}`
+  );
   if (!res.ok) throw new Error(`peachify ${provider.name} API ${res.status}`);
   const json = await res.json();
   if (json.isEncrypted) return decryptPayload(json.data);
@@ -122,9 +151,13 @@ async function fetchVidnestProvider(provider, type, id, season, episode) {
   const slug = provider.slug || provider.name;
   let url = `${VIDNEST_API}/${slug}/${type}/${id}`;
   if (type === 'tv') url += `/${season}/${episode}`;
-  const res = await fetch(url, {
-    headers: { Referer: VIDNEST_REFERER, 'User-Agent': STREAM_UA },
-  });
+  const res = await withTimeout(
+    fetch(url, {
+      headers: { Referer: VIDNEST_REFERER, 'User-Agent': STREAM_UA },
+    }),
+    6000,
+    `vidnest ${provider.name}`
+  );
   if (res.status === 502 || res.status === 404) {
     throw new Error(`vidnest ${provider.name}: no source (${res.status})`);
   }
@@ -170,12 +203,13 @@ async function resolveVidnest({ type, id, season, episode, server }) {
   }
 
   // auto: last-known-good provider first, then the rest (some are content-gated
-  // and 502 per-title, so cycling matters)
+  // and 502 per-title, so cycling matters). Recently-failed providers are skipped.
   const key = titleKey(type, id, season, episode);
   const cached = vidnestCache.get(key);
-  const order = cached
+  const baseOrder = cached
     ? [cached, ...VIDNEST_PROVIDERS.filter((p) => p.name !== cached.name)]
     : VIDNEST_PROVIDERS;
+  const order = baseOrder.filter((p) => !isDead('vidnest', p, key));
 
   let lastError = null;
   for (const p of order) {
@@ -187,6 +221,7 @@ async function resolveVidnest({ type, id, season, episode, server }) {
       }
     } catch (e) {
       lastError = e;
+      markDead('vidnest', p, key);
     }
   }
   throw new Error(`No vidnest source found${lastError ? ` (${lastError.message})` : ''}`);
@@ -238,9 +273,10 @@ async function resolveStream({ type, id, season, episode, server }) {
   // peachify provider comes up empty, fall back to the vidnest family.
   const key = titleKey(type, id, season, episode);
   const cached = providerCache.get(key);
-  const order = cached
+  const baseOrder = cached
     ? [cached, ...PROVIDERS.filter((p) => p.name !== cached.name)]
     : PROVIDERS;
+  const order = baseOrder.filter((p) => !isDead('peachify', p, key));
 
   let lastError = null;
   for (const p of order) {
@@ -253,6 +289,7 @@ async function resolveStream({ type, id, season, episode, server }) {
       }
     } catch (e) {
       lastError = e;
+      markDead('peachify', p, key);
     }
   }
 
@@ -297,4 +334,10 @@ module.exports = {
   VIDNEST_PROVIDERS,
   PEACHIFY_KEY_HEX,
   PEACHIFY_API,
+  // internals — exported for the test suite (tests/extractor.test.js)
+  decryptPayload,
+  vidnestDecode,
+  vidnestToResult,
+  toResult,
+  VIDNEST_ALPHABET,
 };

@@ -69,6 +69,9 @@ const Player = (() => {
   }
 
   // ---- main player ----
+  const PROGRESS_KEY = 'myflixerz-progress'; // { [mediaId/episodeId]: {pos,dur,title,type,image,t} }
+  const RESUME_MIN = 30; // seconds before we offer a resume
+
   class MoviePlayer {
     constructor(shell) {
       this.shell = shell;
@@ -82,19 +85,90 @@ const Player = (() => {
       this.ready = false;
       this._intro = null;
       this._introFired = false;
+      this.resumePos = 0;
+      this._pendingResume = false;
+      this._started = false;
+      this._lastSave = 0;
 
-      this.video.addEventListener('timeupdate', () => this._checkIntro());
+      this.video.addEventListener('timeupdate', () => {
+        this._checkIntro();
+        this._saveProgress(false);
+      });
+      this.video.addEventListener('ended', () => this._saveProgress(true));
+      this.video.addEventListener('play', () => this.shell.dispatchEvent(new CustomEvent('play-state', { detail: { playing: true } })));
+      this.video.addEventListener('pause', () => this.shell.dispatchEvent(new CustomEvent('play-state', { detail: { playing: false } })));
+
+      // keyboard shortcuts (skip when typing in a field)
+      shell.addEventListener('keydown', (e) => {
+        const t = e.target;
+        if (t && (t.matches('input,select,textarea') || t.isContentEditable)) return;
+        switch (e.key) {
+          case ' ':
+          case 'k':
+            this.togglePlay();
+            e.preventDefault();
+            break;
+          case 'ArrowRight':
+          case 'l':
+            this.video.currentTime = Math.min(this.video.duration || Infinity, this.video.currentTime + 10);
+            e.preventDefault();
+            break;
+          case 'ArrowLeft':
+          case 'j':
+            this.video.currentTime = Math.max(0, this.video.currentTime - 10);
+            e.preventDefault();
+            break;
+          case 'ArrowUp':
+            this.video.volume = Math.min(1, (this.video.volume || 0) + 0.1);
+            e.preventDefault();
+            break;
+          case 'ArrowDown':
+            this.video.volume = Math.max(0, (this.video.volume || 0) - 0.1);
+            e.preventDefault();
+            break;
+          case 'm':
+            this.video.muted = !this.video.muted;
+            e.preventDefault();
+            break;
+          case 'f':
+            this.toggleFullscreen();
+            e.preventDefault();
+            break;
+          case '>':
+          case '.':
+            this.changeSpeed(0.25);
+            e.preventDefault();
+            break;
+          case '<':
+          case ',':
+            this.changeSpeed(-0.25);
+            e.preventDefault();
+            break;
+        }
+      });
     }
 
-    load({ mediaId, episodeId = '1-1', title, server = null }) {
+    load({ mediaId, episodeId = '1-1', title, server = null, image = '' }) {
       this.mediaId = mediaId;
       this.episodeId = episodeId;
       this.server = server;
+      this._title = title || '';
+      this._image = image;
       this.quality = localStorage.getItem('myflixerz-quality') || 'auto';
       this.audio = localStorage.getItem('myflixerz-audio') || 'auto';
       this._triedServers = null;
       this._intro = null;
       this._introFired = false;
+      this._started = false;
+      this._lastSave = 0;
+      // where we left off on THIS title+episode (resume on first successful attach)
+      try {
+        const map = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
+        this.resumePos = (map[`${mediaId}/${episodeId}`] || {}).pos || 0;
+      } catch (e) {
+        this.resumePos = 0;
+      }
+      this._pendingResume = this.resumePos > RESUME_MIN;
       this.showLoading('Finding streams…');
       API.sources(mediaId, episodeId, server)
         .then((res) => {
@@ -112,6 +186,7 @@ const Player = (() => {
 
     _play() {
       if (!this.sources.length) return this.showError('No playable sources found.');
+      this._started = true;
       // respect the stored audio choice (dub) when this server carries it
       let src = null;
       if (this.audio !== 'auto') src = this.sources.find((s) => s.dub === this.audio) || null;
@@ -137,6 +212,21 @@ const Player = (() => {
     _attach(src) {
       const url = playableUrl(src.url, src.referer);
       this.hideLoading();
+
+      // resume where we left off once the first source of this session has
+      // real duration (only on the initial load — not on server switches)
+      this.video.addEventListener(
+        'loadedmetadata',
+        () => {
+          if (!this._pendingResume || !this.video.duration) return;
+          if (this.resumePos < this.video.duration - RESUME_MIN) {
+            this.video.currentTime = this.resumePos;
+            this.shell.dispatchEvent(new CustomEvent('progress-resumed', { detail: { pos: this.resumePos } }));
+          }
+          this._pendingResume = false;
+        },
+        { once: true }
+      );
 
       if (this.hls) {
         this.hls.destroy();
@@ -199,6 +289,51 @@ const Player = (() => {
       }
     }
 
+    // Watch-position persistence (powers resume + the Continue Watching row).
+    // Throttled to one write per 5s; entry is removed once the title is over.
+    _saveProgress(ended) {
+      if (!this.mediaId || !this._started) return;
+      const now = Date.now();
+      if (!ended && this._lastSave && now - this._lastSave < 5000) return;
+      this._lastSave = now;
+      try {
+        const map = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
+        const key = `${this.mediaId}/${this.episodeId}`;
+        const pos = this.video.currentTime || 0;
+        const dur = this.video.duration || 0;
+        if (ended || (dur && pos / dur > 0.95)) {
+          delete map[key];
+        } else if (pos > 5) {
+          map[key] = { pos, dur, title: this._title, type: this.mediaId.split('/')[0], image: this._image, episodeId: this.episodeId, t: now };
+        }
+        localStorage.setItem(PROGRESS_KEY, JSON.stringify(map));
+      } catch (e) {}
+    }
+
+    // ---- playback controls (keyboard + toolbar) ----
+    togglePlay() {
+      if (this.video.paused) this.video.play().catch(() => {});
+      else this.video.pause();
+    }
+
+    toggleFullscreen() {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else this.shell.requestFullscreen && this.shell.requestFullscreen().catch(() => {});
+    }
+
+    togglePip() {
+      if (!this.video.requestPictureInPicture) return;
+      if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
+      else this.video.requestPictureInPicture().catch(() => {});
+    }
+
+    /** Nudge playback speed by `delta` (0.25), clamped to [0.25, 2]. */
+    changeSpeed(delta) {
+      const rate = Math.round((this.video.playbackRate + delta) * 100) / 100;
+      this.video.playbackRate = Math.min(2, Math.max(0.25, rate));
+      this.shell.dispatchEvent(new CustomEvent('speed-change', { detail: { rate: this.video.playbackRate } }));
+    }
+
     _emitQuality(levels) {
       this.shell.dispatchEvent(new CustomEvent('quality-ready', { detail: { levels } }));
     }
@@ -224,9 +359,11 @@ const Player = (() => {
       }
     }
 
-    // All streams on the current server died — silently move to the next server
-    // (each server re-resolves its own sources). Bounded by _triedServers.
+    // All streams on the current server died — move to the next server with a
+    // visible notice (each server re-resolves its own sources). Bounded by
+    // _triedServers so we never loop forever.
     _autoAdvance() {
+      this.showLoading(`Server ${PROVIDER_LABELS[this.server] || this.server || '?'} failed — trying next…`);
       if (!this._triedServers) this._triedServers = new Set(this.server ? [this.server] : []);
       const idx = SERVER_FALLBACK_ORDER.indexOf(this.server);
       for (let i = idx === -1 ? 0 : idx + 1; i < SERVER_FALLBACK_ORDER.length; i++) {
