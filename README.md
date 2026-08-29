@@ -1,20 +1,42 @@
-# Cinephiles Areana — NO ADS · NO RESTRICTIONS · NO PAYMENT · COMPLETELY OPEN SOURCE · 20X VOLUME · ENGLISH SUBTITLES SUPPORTED · FREE MOVIES / SERIES / DOCUMENTARIES
+# Cinephiles Areana
 
-F*CK AMAZON. F*CK NETFLIX. Cinephiles areana.
+<div align="center">
 
-Self-hosted streaming frontend. Zero scraping, zero browser automation in runtime. Every stream fetched server-side via Peachify + Vidnest embed APIs (AES/GCM + base64 decoded in `extractor.js`). Browser talks only to localhost. English subtitles via SubDL + OpenSubtitles. Play any movie/series instantly — no sign-up, no tracking, no paywall.
+**A self-hosted, ad-free, restriction-free streaming frontend.**
 
+Completely open source · 20× volume · English subtitles supported · free movies, series & documentaries
 
-Playback is sourced from **two embed families** — Peachify (5 internal
-providers) and Vidnest (5 providers) — plus TMDB for all metadata and two
-independent subtitle APIs. Each embed API returns **encrypted JSON** that we
-decrypt in `extractor.js`; there is no scraping and no browser automation in the
-runtime app (Playwright is a dev-only dependency used for smoke tests in `/tmp`).
+</div>
+
+> **Disclaimer:** This project does **not** host or distribute any copyrighted
+> content. It is a thin frontend that fetches playback URLs from publicly
+> available embed APIs and proxies them through your own server so the browser
+> never contacts the upstream hosts directly.
+
+## What it is
+
+Cinephiles Areana is a single-process **self-hosted streaming app**. The user
+opens a browser tab pointed at `http://localhost:3000`; that page never reaches
+the public internet on its own. Every embed-API call, every decryption step, and
+every stream fetch happens on the server, and only the resulting media is
+proxied back to the browser.
+
+### Highlights
+
+| Feature | How |
+|---|---|
+| **No tracker, no ads in your browser** | The browser only talks to your own Express server on `localhost`. |
+| **No scraping at runtime** | Playback is assembled from two embed families — **Peachify** (5 providers) and **Vidnest** (5 providers) — that return *encrypted JSON*, which we decrypt in `extractor.js`. No headless browser in the request path. |
+| **Encrypted embeds, decrypted server-side** | Peachify payloads are AES-256-GCM encrypted; Vidnest payloads use a custom-alphabet encoding. The keys/alphabet are read from environment variables — never hard-coded. |
+| **English subtitles** | SubDL + OpenSubtitles providers; subtitle tracks are muxed in parallel and selected in the player. |
+| **20× volume** | A simple HTML5 audio gain node sits behind the player slider — useful for quiet laptop speakers or noisy rooms. |
+| **Referer-gated CDN pass-through** | `/play` is a constant-memory range/Referer-rewriting reverse proxy, so even large files stream without buffering the whole file in RAM. |
+| **Open source & single-command** | One `docker compose up -d --build` spins up the entire stack on port 3000. |
 
 ```
-Browser ──(localhost only)──▶ Express server ──▶ Peachify / Vidnest / TMDB / subtitle APIs
-                                     │
-                                     └──▶ /play proxy ──▶ stream CDNs (Referer-gated)
+  Browser ──(localhost only)──▶ Express server ──▶ Peachify / Vidnest / TMDB / subtitle APIs
+                                        │
+                                        └──▶ /play proxy ──▶ stream CDNs (Referer-gated)
 ```
 
 ---
@@ -42,7 +64,7 @@ flowchart LR
     end
 
     subgraph Resolvers["Embed resolvers (extractor.js)"]
-        peachify["Peachify resolver<br/>AES-256-GCM decrypt"]
+    X->>X: AES-256-GCM decrypt (key from env, never in source)
         vidnest["Vidnest resolver<br/>custom-base64 decrypt"]
         ps{" "}
     end
@@ -100,7 +122,7 @@ sequenceDiagram
     Note over X,P: server given → that family only;<br/>auto → peachify cycle (hr→air→holly→multi→moviebox)<br/>then vidnest cycle as fallback
     X->>P: GET /{provider}/{type}/{id}[/{s}/{e}]
     P-->>X: {"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}
-    X->>X: AES-256-GCM decrypt (key in extractor.js)
+    X->>X: AES-256-GCM decrypt (key from env, never in source)
     Note over X,V: if peachify yielded nothing: vidnest path
     X->>V: GET /{provider}/{type}/{id}[/{s}/{e}]
     V-->>X: {"encrypted":true,"data":"<custom-base64>"}
