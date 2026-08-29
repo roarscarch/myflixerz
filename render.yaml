@@ -1,0 +1,13 @@
+# Render blueprint for the watch-rooms deployment (free tier, one service).
+# The whole app runs here: movies + rooms REST + the self-hosted PeerJS
+# signaling server (/peerjs) — no third-party broker, no separate services.
+services:
+  - type: web
+    name: cinephiles-areana
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20

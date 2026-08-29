@@ -168,7 +168,8 @@ All routes serve JSON. `episodeId` = `{season}-{episode}` for TV
 |---|---|---|
 | `GET /search` | `query`, `page` | TMDB multi-search, movies+TV |
 | `GET /info/:mediaId(*)` | — | Detail + credits + recommendations + episodes |
-| `GET /sources/:episodeId` | `mediaId`, `server?` | `{headers, sources[], subtitles[], provider, embedUrl}` |
+| `GET /sources/:episodeId` | `mediaId`, `server?` | `{headers, sources[], provider, embedUrl}` — stream-only for fastest first frame |
+| `GET /subtitles/:episodeId` | `mediaId` | `{subtitles[]}` — browser fetches in parallel with playback, attaches late |
 | `GET /servers/:episodeId` | `mediaId` | list of the 10 server names |
 | `GET /dubs/:episodeId` | `mediaId` | `{iron: ["Hindi",...], multi: [...]}` — audio languages |
 | `GET /recent/movies` · `GET /recent/tv` | — | TMDB now-playing / on-the-air |

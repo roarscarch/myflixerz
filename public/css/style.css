@@ -70,7 +70,7 @@ button { font-family: inherit; }
   letter-spacing: -0.02em;
   white-space: nowrap;
 }
-.brand span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+/* (gradient brand styling removed — Cinephiles Areana rebrand) */
 
 .nav-links { display: flex; gap: 6px; }
 .nav-links a {
@@ -207,7 +207,7 @@ button { font-family: inherit; }
   line-height: 1.08;
   margin-bottom: 14px;
 }
-.hero h1 .grad { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+/* (hero gradient removed — no hero on the home page) */
 .hero p { color: var(--muted); font-size: 1.05rem; max-width: 520px; margin: 0 auto 34px; }
 
 .hero-search {
@@ -334,6 +334,20 @@ button { font-family: inherit; }
   transition: opacity 0.25s;
 }
 .card:hover .poster-wrap::after { opacity: 1; }
+
+.card-rating {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(6px);
+  color: #ffd54f; /* gold star — score chip is the one color accent */
+}
 
 .card-badge {
   position: absolute;
@@ -717,6 +731,43 @@ button { font-family: inherit; }
 .skip-intro.show { display: inline-block; }
 @keyframes rise { from { transform: translateY(10px); opacity: 0; } }
 
+/* "Next episode" — appears up to 5 min before the end, so it must NOT compete
+   with the picture: compact, translucent corner tag; gains full prominence
+   only on hover. Stacked above skip-intro so the two never collide. */
+.next-ep {
+  position: absolute;
+  right: 14px;
+  bottom: 118px;
+  z-index: 20;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(12, 12, 20, 0.55);
+  color: rgba(255, 255, 255, 0.82);
+  font-weight: 600;
+  font-size: 0.74rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  opacity: 0.62;
+  transform: translateY(4px);
+  transition: opacity 0.35s ease, transform 0.35s ease, background 0.2s ease,
+    color 0.2s ease, border-color 0.2s ease, padding 0.2s ease;
+  display: none;
+}
+.next-ep.show { display: inline-block; animation: fadein 0.8s ease; }
+.next-ep:hover {
+  opacity: 1;
+  transform: translateY(0);
+  padding: 9px 16px;
+  background: var(--grad);
+  border-color: transparent;
+  color: #fff;
+  font-size: 0.84rem;
+  box-shadow: 0 8px 24px rgba(124, 92, 255, 0.4);
+}
+@keyframes fadein { from { opacity: 0; } }
+
 /* ============ Skeletons ============ */
 .skel {
   position: relative;
@@ -804,3 +855,26 @@ button { font-family: inherit; }
   z-index: 2;
 }
 .card-progress i { display: block; height: 100%; background: var(--accent); }
+
+
+/* Volume boost popup (Web Audio gain > 100%) */
+.vol-wrap { position: relative; }
+.vol-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  white-space: nowrap;
+  min-width: 200px;
+}
+.vol-pop input[type="range"] { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.vol-pop span { font-size: 0.8rem; font-weight: 700; color: var(--text); min-width: 46px; text-align: right; }
+

@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { TvType } = require('./models');
 const { resolveStream, fetchSubtitles, fetchVidnestSubtitles, PROVIDERS, VIDNEST_PROVIDERS } = require('./extractor');
+const { fetchEnglishSubtitles } = require('./opensubs'); // primary English subtitle source
 
 // Public TMDB key used by myflixerfree.to (override via TMDB_API_KEY env).
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
@@ -11,6 +12,17 @@ const IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 // plus vidnest's (Videasy/HollyMovie/Rogflix/Buzz/NGC). Each is a direct JSON
 // API — no scraping, no browser. resolveStream dispatches by name.
 const SERVERS = [...PROVIDERS, ...VIDNEST_PROVIDERS];
+
+// Subtitle lookups are ENRICHMENT, never a playback gate: race them against a
+// short deadline and serve whatever landed ([] on overrun). The underlying
+// fetches stay bounded (extractor) so sockets don't linger either.
+function withDeadline(promise, ms) {
+  let t;
+  const cap = new Promise((resolve) => {
+    t = setTimeout(() => resolve([]), ms);
+  });
+  return Promise.race([promise, cap]).finally(() => clearTimeout(t));
+}
 
 class FlixHQ {
   constructor() {
@@ -53,6 +65,19 @@ class FlixHQ {
     return p;
   }
 
+  // TMDB imdb_id for a title — used by the OpenSubtitles subtitle search.
+  // Long cache: an imdb id is stable for the life of the title.
+  _imdbId(type, id) {
+    return this._cached(`imdb:${type}:${id}`, 7 * 24 * 60 * 60 * 1000, async () => {
+      try {
+        const { data } = await this.tmdb.get(`/${type}/${id}/external_ids`);
+        return data.imdb_id || null;
+      } catch (e) {
+        return null;
+      }
+    });
+  }
+
   _img(path) {
     return path ? `${IMAGE_BASE}${path}` : null;
   }
@@ -75,6 +100,7 @@ class FlixHQ {
       image: this._img(tmdbItem.poster_path || tmdbItem.backdrop_path),
       releaseDate: (tmdbItem.release_date || tmdbItem.first_air_date || '').split('-')[0] || undefined,
       type: type === 'movie' ? TvType.MOVIE : TvType.TVSERIES,
+      rating: tmdbItem.vote_average || 0, // 0–10 score — powers the ★ chip on cards
     };
   }
 
@@ -203,8 +229,9 @@ class FlixHQ {
     return this._cached(`sources:${episodeId}:${mediaId}:${server || 'auto'}`, 60 * 1000, () => this._episodeSources(episodeId, mediaId, server));
   }
 
-  async _episodeSources(episodeId, mediaId, server = null) {
-    const [type, id] = mediaId.split('/');
+  // Shared mediaId/episodeId parsing for the sources and subtitles endpoints.
+  _parseMedia(episodeId, mediaId) {
+    const [type, id] = String(mediaId).split('/');
     if (!type || !id) throw new Error('mediaId must be movie/{id} or tv/{id}');
 
     let season = 1;
@@ -214,31 +241,65 @@ class FlixHQ {
       if (m) {
         season = m[1];
         episode = m[2];
-      } else if (episodeId.includes('-')) {
-        [season, episode] = episodeId.split('-');
+      } else if (String(episodeId).includes('-')) {
+        [season, episode] = String(episodeId).split('-');
       }
     }
+    return { type, id, season, episode };
+  }
 
-    // resolveStream dispatches peachify vs vidnest by server name; with no
-    // server it auto-cycles peachify then falls back to vidnest. Subtitles are
-    // merged from both families' APIs (each is title-level, not provider-level).
-    const [stream, subs, vsubs] = await Promise.all([
-      resolveStream({ type, id, season, episode, server }),
-      fetchSubtitles(type, id, season, episode),
-      fetchVidnestSubtitles(type, id, season, episode),
-    ]);
+  // Merge OpenSubtitles-first English with the built-in family tracks, deduped.
+  _mergeSubtitles(osSubs, subs, vsubs) {
+    const isEn = (s) => /english|\beng\b|\ben\b/i.test(`${s.label || ''} ${s.lang || ''}`);
+    const builtIn = [...subs, ...vsubs]; // peachify + vidnest title-level subs
+    const merged = osSubs.length
+      ? [...osSubs, ...builtIn.filter((s) => !isEn(s))] // OS owns EN; keep non-EN
+      : builtIn; // OS empty/unconfigured → existing family sources
     const seen = new Set();
-    const subtitles = [...subs, ...vsubs].filter((s) => {
-      if (seen.has(s.label)) return false;
-      seen.add(s.label);
+    return merged.filter((s) => {
+      const k = s.label || s.lang || 'unknown';
+      if (seen.has(k)) return false;
+      seen.add(k);
       return true;
     });
-    const embedUrl = this._playerUrl(type, id, '', season, episode);
+  }
 
+  /**
+   * Subtitle tracks ONLY. The browser fires this IN PARALLEL with playback and
+   * attaches tracks whenever it lands — so unlike /sources there is no reason
+   * to be stingy: generous-but-bounded budget, never blocking first frame.
+   */
+  async fetchEpisodeSubtitles(episodeId, mediaId) {
+    const { type, id, season, episode } = this._parseMedia(episodeId, mediaId);
+    const budgetMs = 6000;
+    const imdbP = this._imdbId(type, id);
+    const [subs, vsubs, osSubs] = await Promise.all([
+      withDeadline(fetchSubtitles(type, id, season, episode), budgetMs),
+      withDeadline(fetchVidnestSubtitles(type, id, season, episode), budgetMs),
+      withDeadline(
+        imdbP.then((imdbId) =>
+          imdbId ? fetchEnglishSubtitles({ type, imdbId, season, episode }) : []
+        ),
+        budgetMs
+      ),
+    ]);
+    return this._mergeSubtitles(osSubs, subs, vsubs);
+  }
+
+  async _episodeSources(episodeId, mediaId, server = null) {
+    const { type, id, season, episode } = this._parseMedia(episodeId, mediaId);
+
+    // FIRST FRAME IS THE ONLY CONTRACT ON THIS PATH. Zero subtitle work — not
+    // even deadline-raced. Tracks are decoration the browser pulls separately
+    // from GET /subtitles (fetchEpisodeSubtitles) and attaches after playback
+    // starts, so even a fully dead subtitle API cannot delay one frame here.
+    const stream = await resolveStream({ type, id, season, episode, server });
+
+    const embedUrl = this._playerUrl(type, id, '', season, episode);
     return {
       headers: { Referer: 'https://peachify.top/' },
       sources: stream.sources,
-      subtitles,
+      subtitles: [], // intentionally empty — tracks come from /subtitles
       provider: stream.provider,
       server: stream.provider,
       embedUrl,
@@ -373,7 +434,7 @@ class FlixHQ {
     return this._discover('movie', page, { with_genres: id });
   }
 
-  async fetchTopIMDB(type = 'all', page = 1) {
+  async fetchTopIMDB(type = 'all', page = 1, minVote) {
     if (type === 'all') {
       // merge movie + tv pages (page 1 of each)
       const [movies, tv] = await Promise.all([
@@ -387,7 +448,9 @@ class FlixHQ {
       };
     }
     if (type !== 'movie' && type !== 'tv') throw new Error("type must be 'movie', 'tv' or 'all'");
-    return this._discover(type, page, { sort_by: 'vote_average.desc', 'vote_count.gte': 500 });
+    const params = { sort_by: 'vote_average.desc', 'vote_count.gte': 500 };
+    if (minVote) params['vote_average.gte'] = minVote; // e.g. 7.5 → "IMDb 7.5+" list
+    return this._discover(type, page, params);
   }
 }
 

@@ -10,7 +10,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # app code
-COPY server.js flixhq.js extractor.js models.js ./
+COPY server.js flixhq.js extractor.js models.js opensubs.js ./
 COPY public ./public
 
 ENV NODE_ENV=production

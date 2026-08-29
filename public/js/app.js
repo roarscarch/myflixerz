@@ -7,7 +7,9 @@
   const searchDropdown = document.getElementById('searchDropdown');
 
   const GENRES = ['Action', 'Adventure', 'Comedy', 'Crime', 'Drama', 'Fantasy', 'Horror', 'Mystery', 'Romance', 'Sci-Fi', 'Thriller', 'War'];
-  const TYPE_LABEL = { movie: 'Movie', tv: 'TV' };
+  // Markup helpers live in render.js — shared with the server's SSR pass so
+  // pre-rendered HTML and client-rendered HTML can never drift apart.
+  const { card, grid, skeletonRow, rowWithArrows, escapeHtml, homeView } = Render;
 
   // ---------------- helpers ----------------
   function el(html) {
@@ -47,29 +49,6 @@
     window.scrollTo({ top: 0 });
   }
 
-  function card(item) {
-    const [type] = String(item.id || '').split('/');
-    const url = item.href || `#/${type}/${item.id.split('/')[1]}`;
-    const year = item.releaseDate || item.year || '';
-    const badge = type === 'tv' ? 'tv' : 'movie';
-    return el(`
-      <div class="card" data-href="${url}">
-        <div class="poster-wrap">
-          <span class="card-badge ${badge}">${TYPE_LABEL[type] || ''}</span>
-          ${item.image ? `<img src="${item.image}" alt="${escapeHtml(item.title)}" loading="lazy" />` : ''}
-          ${item.progress ? `<div class="card-progress"><i style="width:${item.progress}%"></i></div>` : ''}
-          <div class="card-hover">
-            <div class="ch-title">${escapeHtml(item.title)}</div>
-            <div class="ch-meta">${year ? year + ' · ' : ''}${TYPE_LABEL[type] || ''}</div>
-            <span class="ch-play">${item.progress ? '▶ Continue' : '▶ Watch now'}</span>
-          </div>
-        </div>
-        <div class="card-title">${escapeHtml(item.title)}</div>
-        <div class="card-year">${year}</div>
-      </div>
-    `);
-  }
-
   // ---- continue watching (from saved watch positions) ----
   function fmtTime(sec) {
     sec = Math.max(0, Math.floor(sec || 0));
@@ -102,33 +81,10 @@
     }
   }
 
-  function escapeHtml(s) {
-    return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  }
-
-  function skeletonRow() {
-    let cards = '';
-    for (let i = 0; i < 8; i++) cards += `<div class="card"><div class="skel poster-wrap"></div><div class="skel" style="height:14px;margin-top:8px"></div></div>`;
-    return cards;
-  }
-
-  function grid(items) {
-    return `<div class="grid">${items.map(card).map((c) => c.outerHTML).join('')}</div>`;
-  }
-
   function bindCards(scope) {
     scope.querySelectorAll('.card[data-href]').forEach((c) => {
       c.addEventListener('click', () => (location.hash = c.dataset.href));
     });
-  }
-
-  function rowWithArrows(content) {
-    return `
-      <div class="row-wrap" style="position:relative">
-        <button class="row-arrow prev">‹</button>
-        <div class="row">${content}</div>
-        <button class="row-arrow next">›</button>
-      </div>`;
   }
 
   function bindRowArrows(scope) {
@@ -231,53 +187,44 @@
   views.home = async () => {
     scrollTop();
     setActiveNav(null);
-    view.innerHTML = `
-      <section class="hero">
-        <h1>Watch <span class="grad">anything</span>,<br/>anywhere. Instantly.</h1>
-        <p>Millions of movies and TV shows. No sign-up, no limits — just press play.</p>
-        <div class="hero-search">
-          <input id="heroSearch" type="text" placeholder="Search for a movie or show…" autocomplete="off" spellcheck="false" />
-          <button id="heroSearchBtn">Search</button>
-        </div>
-      </section>
-      <section class="section" id="cwSection" hidden>
-        <div class="section-head"><h2>⏯️ Continue Watching</h2></div>
-        ${rowWithArrows('')}
-      </section>
-      <section class="section" data-row>
-        <div class="section-head"><h2>🔥 Trending Movies</h2><a class="see-all" href="#/movies">See all</a></div>
-        ${rowWithArrows(skeletonRow())}
-      </section>
-      <section class="section" data-row>
-        <div class="section-head"><h2>📺 Trending TV Shows</h2><a class="see-all" href="#/tv-shows">See all</a></div>
-        ${rowWithArrows(skeletonRow())}
-      </section>
-      <section class="section" data-row>
-        <div class="section-head"><h2>🆕 Now Playing</h2><a class="see-all" href="#/movies">See all</a></div>
-        ${rowWithArrows(skeletonRow())}
-      </section>
-      <section class="section" data-row>
-        <div class="section-head"><h2>⭐ Top Rated</h2><a class="see-all" href="#/top-rated">See all</a></div>
-        ${rowWithArrows(skeletonRow())}
-      </section>`;
+    // The server pre-renders this view into the HTML (data-ssr-home on
+    // <main>) — the rows are already painted, so skip the template and the
+    // four fetches. The attribute is consumed once: navigating away and back
+    // falls through to the normal fetch path (server-side cache makes that
+    // cheap anyway).
+    const ssr = view.hasAttribute('data-ssr-home');
+    if (!ssr) view.innerHTML = homeView(null);
+    view.removeAttribute('data-ssr-home');
 
     const heroInput = document.getElementById('heroSearch');
     const heroBtn = document.getElementById('heroSearchBtn');
-    const go = () => {
-      if (heroInput.value.trim()) location.hash = `#/search?q=${encodeURIComponent(heroInput.value.trim())}`;
-    };
-    heroBtn.addEventListener('click', go);
-    heroInput.addEventListener('keydown', (e) => e.key === 'Enter' && go());
-    heroInput.addEventListener('input', () => runSearch(heroInput.value));
+    if (heroInput && heroBtn) {
+      const go = () => {
+        if (heroInput.value.trim()) location.hash = `#/search?q=${encodeURIComponent(heroInput.value.trim())}`;
+      };
+      heroBtn.addEventListener('click', go);
+      heroInput.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+      heroInput.addEventListener('input', () => runSearch(heroInput.value));
+    }
 
     // Continue Watching row from saved positions (hidden when nothing is in progress)
     const cwItems = continueWatchingItems();
     if (cwItems.length) {
       const cw = view.querySelector('#cwSection');
       cw.hidden = false;
-      cw.querySelector('.row-wrap').outerHTML = rowWithArrows(
-        cwItems.map((i) => card(i).outerHTML).join('')
-      );
+      cw.querySelector('.row-wrap').outerHTML = rowWithArrows(cwItems.map(card).join(''));
+    }
+
+    if (ssr) {
+      // rows already painted server-side — wire everything up once, no fetches
+      bindRowArrows(view);
+      bindCards(view);
+      return;
+    }
+
+    // fetch path: bind the Continue Watching row (the four data rows get
+    // replaced + rebound below once their data arrives)
+    if (cwItems.length) {
       bindRowArrows(view);
       bindCards(view);
     }
@@ -285,6 +232,7 @@
     const sections = [
       ['/trending/movies', 'trending-movies'],
       ['/trending/tv', 'trending-tv'],
+      ['/top-imdb?type=movie&minVote=7.5', 'imdb75'],
       ['/recent/movies', 'now-playing'],
       ['/top-imdb?type=all', 'top-rated'],
     ];
@@ -305,7 +253,7 @@
       const items = results[i];
       const sectionEl = view.querySelectorAll('.section[data-row]')[i];
       sectionEl.querySelector('.row-wrap').outerHTML = rowWithArrows(
-        items.slice(0, 14).map((c) => card(c).outerHTML).join('')
+        items.slice(0, 14).map(card).join('')
       );
       bindRowArrows(view);
       bindCards(view);
@@ -317,11 +265,12 @@
     const kind = params.kind; // movies | tv-shows | top-rated | genre
     const genre = params.genre || null;
     scrollTop();
-    setActiveNav(kind === 'movies' ? 'movies' : kind === 'tv-shows' ? 'tv' : 'top');
+    setActiveNav(kind === 'movies' ? 'movies' : kind === 'tv-shows' ? 'tv' : kind === 'imdb75' ? 'imdb75' : 'top');
 
     let title = 'Movies', sub = 'All movies';
     if (kind === 'tv-shows') { title = 'TV Shows'; sub = 'All TV shows'; }
     if (kind === 'top-rated') { title = 'Top Rated'; sub = 'The best of the best'; }
+    if (kind === 'imdb75') { title = 'IMDb 7.5+ Movies'; sub = 'Critically loved films, all in one place — no searching needed'; }
     if (genre) { title = genre; sub = 'Movies in this genre'; }
 
     view.innerHTML = `
@@ -343,14 +292,30 @@
       loadBtn.disabled = true;
       loadBtn.textContent = 'Loading…';
       try {
-        const data = kind === 'genre'
-          ? await API.genre(genre, page)
-          : kind === 'top-rated'
-            ? await API.topImdb('all', page)
-            : await API.browse(kind === 'tv-shows' ? 'tv' : 'movies', page);
+        // Page 1 of the movies grid ships inside the HTML (__INITIAL__, set
+        // by the server alongside the home SSR) — the grid paints without a
+        // round-trip. One-shot: consumed once, later pages fetch normally.
+        let data = null;
+        // Page-1 results ship inside the HTML (__INITIAL__, set by the server
+        // alongside the home SSR) — the grid paints without a round-trip.
+        // One-shot per kind: consumed once, later pages fetch normally.
+        const init = window.__INITIAL__ && window.__INITIAL__.browse && window.__INITIAL__.browse[kind];
+        if (page === 1 && init) {
+          data = { results: init, hasNextPage: true };
+          delete window.__INITIAL__.browse[kind];
+        } else {
+          data = kind === 'genre'
+            ? await API.genre(genre, page)
+            : kind === 'top-rated'
+              ? await API.topImdb('all', page)
+              : kind === 'imdb75'
+                ? await API.imdb75(page)
+                : await API.browse(kind === 'tv-shows' ? 'tv' : 'movies', page);
+        }
         const items = data.results || [];
         hasNext = !!data.hasNextPage;
-        gridEl.insertAdjacentHTML('beforeend', items.map((i) => card(i).outerHTML).join(''));
+        if (page === 1) gridEl.innerHTML = ''; // drop the skeleton placeholders
+        gridEl.insertAdjacentHTML('beforeend', items.map(card).join(''));
         bindCards(view);
         page++;
       } catch (e) {
@@ -395,7 +360,8 @@
           gridEl.innerHTML = '';
           noResults.hidden = false;
         } else {
-          gridEl.insertAdjacentHTML('beforeend', items.map((i) => card(i).outerHTML).join(''));
+          if (page === 1) gridEl.innerHTML = ''; // drop the skeleton placeholders
+          gridEl.insertAdjacentHTML('beforeend', items.map(card).join(''));
           bindCards(view);
         }
         page++;
@@ -432,6 +398,13 @@
         </div>
       </div>`;
 
+    // Fire-and-forget prefetch while the user reads this page: by the time
+    // Play is clicked the server's short-TTL caches usually hold the resolved
+    // stream (+ subtitle tracks), so playback attaches near-instantly. Both
+    // calls are deduped/bounded server-side; failures are irrelevant here.
+    API.sources(mediaId).catch(() => {});
+    API.subtitles(mediaId).catch(() => {});
+
     let info;
     try {
       info = await API.info(mediaId);
@@ -461,7 +434,7 @@
             </div>
             <p class="detail-desc">${escapeHtml(info.description || 'No description available.')}</p>
             <div class="play-actions">
-              <button class="btn btn-primary" id="playBtn">▶ Watch now</button>
+              <button class="btn btn-primary" id="playBtn">Watch now</button>
             </div>
           </div>
         </div>
@@ -478,7 +451,7 @@
       ${recs.length ? `
       <div class="section">
         <div class="section-head"><h2>More like this</h2></div>
-        ${rowWithArrows(recs.map((i) => card(i).outerHTML).join(''))}
+        ${rowWithArrows(recs.map(card).join(''))}
       </div>` : ''}`;
 
     bindRowArrows(view);
@@ -559,9 +532,11 @@
           </div>
           <div class="player-error" hidden><div style="font-size:2rem">⚠️</div><div class="pe-msg"></div></div>
           <button class="skip-intro">Skip intro</button>
+          <button class="next-ep">▶ Next episode</button>
         </div>
         <div class="player-bar" id="serverBar"></div>
         <div class="watch-head" style="margin-top:20px">
+          <button class="subs-select ctl-btn" id="nextChip" hidden title="Play the next episode">▶ Next episode</button>
           <select class="subs-select" id="audioSelect" hidden>
             <option value="auto">Audio: Auto</option>
           </select>
@@ -574,6 +549,13 @@
           <button class="subs-select ctl-btn" id="speedBtn" title="Playback speed (shortcuts: > / <)">Speed: 1x</button>
           <button class="subs-select ctl-btn" id="pipBtn" title="Picture in picture">⧉ PiP</button>
           <button class="subs-select ctl-btn" id="downloadBtn" title="Download this video">↓ Download</button>
+          <span class="vol-wrap">
+            <button class="subs-select ctl-btn" id="volBtn" title="Volume (shortcuts: ↑ / ↓)">🔊 100%</button>
+            <div class="vol-pop" id="volPop" hidden>
+              <input id="volRange" type="range" min="10" max="800" value="100" step="5" />
+              <span id="volLabel">100%</span>
+            </div>
+          </span>
           <span class="sub" id="providerInfo"></span>
         </div>
       </div>`;
@@ -627,23 +609,66 @@
       a.remove();
       toastMsg('Download started — check your Downloads folder.');
     });
+    // volume boost (>100% via Web Audio gain). Button shows the live %, popup
+    // has a 10–400% slider; the player routes through gain+limiter.
+    const volBtn = view.querySelector('#volBtn');
+    const volPop = view.querySelector('#volPop');
+    const volRange = view.querySelector('#volRange');
+    const volLabel = view.querySelector('#volLabel');
+    const syncVol = (v) => {
+      const pct = Math.round(v * 100);
+      volRange.value = pct;
+      volLabel.textContent = pct + '%';
+      volBtn.textContent = (pct > 150 ? '🔊' : pct > 100 ? '🔉' : '🔈') + ' ' + pct + '%';
+      volBtn.title = `Volume ${pct}% (boost beyond 100%; shortcut: ↑ / ↓)`;
+    };
+    volBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      volPop.hidden = !volPop.hidden;
+    });
+    volRange.addEventListener('input', () => player.setVolume(Number(volRange.value) / 100));
+    player.shell.addEventListener('volume-change', (e) => syncVol(e.detail.volume));
+    document.addEventListener('click', (e) => {
+      if (!volPop.contains(e.target) && !volBtn.contains(e.target)) volPop.hidden = true;
+    });
+    syncVol(player.getVolume());
     shell.addEventListener('progress-resumed', (e) => toastMsg(`Resumed from ${fmtTime(e.detail.pos)}`));
-    shell.addEventListener('sources-ready', (e) => {
-      const labels = Player.PROVIDER_LABELS;
-      const p = e.detail.provider;
-      document.getElementById('providerInfo').textContent = p ? `Server: ${labels[p] || p} · ${e.detail.subtitles.length} subtitles available` : '';
-      // populate subtitle picker (lazy: content loads only when selected)
-      const subs = e.detail.subtitles || [];
+    // Subtitle UI lives on the 'subtitles-ready' event: tracks arrive on their
+    // OWN timeline (GET /subtitles → player.setSubtitles) — potentially well
+    // after first frame. sources-ready only refreshes the count/label and
+    // reapplies the pick after a server switch.
+    function refreshSubtitleUI() {
+      const subs = player.subtitles || [];
       subsSelect.innerHTML = '<option value="">Subtitles: Off</option>' +
         subs.map((s, i) => `<option value="${i}">${escapeHtml(s.label || s.lang || 'Subtitle ' + (i + 1))}</option>`).join('');
       subsSelect.disabled = subs.length === 0;
+      // Smart subtitles: auto-show the stored choice, else the English track
+      // (autoSubtitle returns null for 'off' or when no subs exist).
+      const auto = player.autoSubtitle();
+      const autoIdx = auto ? subs.indexOf(auto) : -1;
+      subsSelect.value = autoIdx >= 0 ? String(autoIdx) : '';
+      player.loadSubtitle(auto ? auto.url : '', auto ? auto.label : '');
+      if (auto && !localStorage.getItem('myflixerz-subtitle')) {
+        localStorage.setItem('myflixerz-subtitle', auto.label); // remember across views
+      }
+    }
+    shell.addEventListener('subtitles-ready', () => refreshSubtitleUI());
+    shell.addEventListener('sources-ready', (e) => {
+      const labels = Player.PROVIDER_LABELS;
+      const p = e.detail.provider;
+      const n = (player.subtitles || []).length;
+      document.getElementById('providerInfo').textContent =
+        p ? `Server: ${labels[p] || p}${n ? ` · ${n} subtitle${n === 1 ? '' : 's'}` : ''}` : '';
+      if ((player.subtitles || []).length) refreshSubtitleUI(); // server switch → reapply
       collectDubs();
     });
     subsSelect.addEventListener('change', () => {
       const i = subsSelect.value;
       const sub = i === '' ? null : (player.subtitles || [])[parseInt(i, 10)];
       player.loadSubtitle(sub ? sub.url : '', sub ? sub.label : '');
+      localStorage.setItem('myflixerz-subtitle', sub ? sub.label : 'off'); // Off = remember "no subs"
     });
+    shell.addEventListener('subtitle-error', (e) => toastMsg(`Subtitle failed to load${e.detail.label ? ': ' + e.detail.label : ''} `));
     // audio dropdown — lists every dub across the dub-capable servers, not just
     // the current one. Picking a language that lives on another server switches
     // to it automatically. Resolution-suffixed labels (English-Hindi-1080p)
@@ -728,6 +753,59 @@
         levels.map((h) => `<option value="${h}">${h}p</option>`).join('');
       qualitySelect.value = levels.includes(String(player.quality)) ? player.quality : 'auto';
     });
+    // Subtitle enrichment fired NOW, in parallel with player.load — it rides
+    // its own endpoint and attaches whenever it lands (never blocks play).
+    API.subtitles(mediaId, episodeId)
+      .then((res) => player.setSubtitles(res && res.subtitles))
+      .catch(() => {}); // silent — zero tracks is a fine outcome
+
+    // ---- next episode (TV): click straight into the next one, no detail-page
+    // round trip. Cross-season-aware (S1 finale → S2E1). ROBUSTNESS: never
+    // depends on the single awaited /info attempt above — if it failed (fresh
+    // server, blip), we retry independently here; both paths share one apply().
+    const nextBtn = view.querySelector('.next-ep');
+    const nextChip = view.querySelector('#nextChip');
+    const applyNext = (epsRaw) => {
+      if (!Array.isArray(epsRaw) || !epsRaw.length || !nextBtn) return false;
+      // normalize whatever episodeId shape arrives ('2-10', 's2e10', '2/e10')
+      const norm = (v) => {
+        const m = String(v).match(/^(?:s)?(\d+)(?:e|[-/])(\d+)$/i);
+        return m ? [Number(m[1]), Number(m[2])] : null;
+      };
+      const eps = [...epsRaw].sort((a, b) => a.season - b.season || a.number - b.number);
+      // exact id match first, structured fallback (NEVER default to eps[0])
+      let i = eps.findIndex((e) => String(e.id) === String(episodeId));
+      if (i < 0) {
+        const cur = norm(episodeId);
+        if (!cur) return false;
+        i = eps.findIndex((e) => e.season === cur[0] && e.number === cur[1]);
+      }
+      if (i < 0) return false;
+      const nxt = eps[i + 1];
+      if (!nxt) return false; // last episode — nothing to offer
+      player.setNextEpisode(nxt.id);
+      const go = () => { location.hash = `#/watch/${type}/${id}/${nxt.id}`; };
+      nextBtn.onclick = go;
+      nextChip.onclick = go;
+      nextChip.hidden = false;
+      nextChip.textContent = `▶ S${nxt.season} · E${nxt.number}`;
+      return true;
+    };
+    const wirePillReveal = () => {
+      if (!nextBtn) return;
+      const reveal = () => { if (player.nextEpisodeId) nextBtn.classList.add('show'); };
+      shell.addEventListener('up-next', reveal);
+      shell.addEventListener('episode-ended', reveal);
+    };
+    wirePillReveal();
+    if (type === 'tv') {
+      if (!applyNext(info && info.episodes)) {
+        API.info(mediaId)
+          .then((inf) => applyNext(inf && inf.episodes))
+          .catch(() => {}); // silent: last-episode/no-data hides the affordance
+      }
+    }
+
     player.load({ mediaId, episodeId, title, image: info ? info.image : '' });
   };
 
@@ -742,6 +820,11 @@
 
   async function route() {
     const { parts, params } = parseHash();
+    // The SSR home markup only survives until the first navigation — any
+    // other view replaces it, so the flag must not outlive that render
+    // (otherwise a later home visit would skip its template and query DOM
+    // that no longer exists).
+    if (parts.length) view.removeAttribute('data-ssr-home');
     if (!parts.length) return views.home();
     switch (parts[0]) {
       case 'movie':
@@ -757,6 +840,8 @@
         return views.browse({ kind: 'tv-shows' });
       case 'top-rated':
         return views.browse({ kind: 'top-rated' });
+      case 'imdb75':
+        return views.browse({ kind: 'imdb75' });
       case 'genre':
         if (parts[1]) return views.browse({ kind: 'genre', genre: parts[1] });
         break;

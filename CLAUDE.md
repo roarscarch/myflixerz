@@ -40,10 +40,21 @@ full architecture, server tables, and the add-a-server recipe — read it first.
   URI=`, absolute) to `/play`, streams back with `Access-Control-Allow-Origin: *`.
 - Rate limiter (600/15min) must keep skipping `/play`; static is served before
   the limiter.
+- **OpenSubtitles EN subs** (`opensubs.js`): the primary English subtitle source,
+  keyed by the TMDB imdb_id (via `/external_ids`, long-cached). Served by
+  **`GET /subtitles/:episodeId?mediaId=`** (`flixhq.fetchEpisodeSubtitles`) —
+  the browser fires it IN PARALLEL with playback and attaches tracks late;
+  `/sources` is stream-only so a sick sub-API can never delay first frame.
+  Requires `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME`,
+  `OPENSUBTITLES_PASSWORD` env vars; unset/bad creds → `[]`, and the
+  peachify/vidnest title APIs remain the fallback (OS owns English only;
+  built-in non-EN tracks always survive). All calls go to
+  `api.opensubtitles.com/api/v1` with a browser `User-Agent` (its gateway 403s
+  default UAs). Per-source deadline inside `/subtitles`: 6 s.
 
 ## Wiring a new server (4 touch points)
 
-1. `extractor.js` — decoder + resolver + cache Map + entry in `PROVIDERS`/`VIDNEST_PROVIDERS` + branch in `resolveStream` dispatch (vidnest names first, then peachify aliases, then auto = peachify cycle → vidnest cycle).
+1. `extractor.js` — decoder + resolver + cache Map + entry in `PROVIDERS`/`VIDNEST_PROVIDERS` + branch in `resolveStream` dispatch (vidnest names first, then peachify aliases, then auto = one CONCURRENT probe wave over each family's healthy providers — peachify wave first, vidnest wave as fallback; priority pick prefers a sub-carrying provider, else the first stream; failures mark providers dead 30 s).
 2. `flixhq.js` — nothing (SERVERS builds from those arrays).
 3. `app.js` — friendly label in `PROVIDER_LABELS`.
 4. `player.js` — position in `SERVER_FALLBACK_ORDER`.
@@ -65,10 +76,28 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
   kill by pid.
 - localStorage keys: `myflixerz-quality` (height or 'auto'), `myflixerz-audio`
   (dub label or 'auto'), `myflixerz-progress` (per-title resume map — keyed
-  `mediaId/episodeId`; powers resume + Continue Watching row).
+  `mediaId/episodeId`; powers resume + Continue Watching row),
+  `myflixerz-volume` (0.1–8, i.e. 10%–800% boost — read by Web Audio gain node
+  in player.js), `myflixerz-subtitle` (auto-shown subtitle label, or 'off').
+  The subtitle pref defaults to the first English track on a server.
 - Tests: `npm test` (node --test) — `tests/extractor.test.js` guards the
   decoders with self-generated fixtures. Keep it green; extend it when the
   cipher or a response shape changes.
+- Extractor resolution budgets (`extractor.js`): auto mode is a FIRST-WIN
+  race — every healthy provider from both families is probed concurrently and
+  the first source-bearing answer is returned immediately (peachify candidates
+  registered first, so exact ties favor it). Cold start ≈ fastest healthy
+  upstream; losers are never waited out. The per-probe ceiling exists ONLY as
+  an anti-blackhole net (`PROBE_TIMEOUT_MS`, default 15 s): it must stay loose,
+  because a tight ceiling kills slow-but-alive providers and manufactures
+  failures (dead-marks + family-breaker trips). Late-settling probes may trip/
+  heal breakers but never rewrite the winner cache. `/sources` does ZERO
+  subtitle work — tracks live entirely on `/subtitles` (client-driven,
+  parallel with playback, 6 s per-source deadline there). Per-provider dead
+  marks are per-title 30 s; a family whose probes ALL reject trips a 60 s
+  breaker (`familyDeadUntil`) so outage days skip it entirely; any successful
+  probe heals it. The detail page also fire-and-forget prefetches /sources +
+  /subtitles so Play usually hits warm server caches.
 - Caching invariants: TTLs live in `flixhq.js._cached` (search 5 min, listings
   10 min, info 15 min, dubs 10 min, sources 60 s). Sources cache must stay
   SHORT — tokenized stream URLs expire upstream. `/play` segment cache
@@ -82,6 +111,17 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
   kill the ffmpeg child (orphaned ffmpeg = disk/CPU leak). Without ffmpeg the
   HLS path 503s with a hint — that is intended behavior, not a bug. Both
   `/play` and `/download` are exempt from the rate limiter.
+- Up Next (TV): `player.setNextEpisode()` gets `eps[i+1]` from /info's
+  cross-season episode list (sorted season→number, so S1 finale → S2E1
+  resolves). Resolution is fault-tolerant: applyNext() uses the awaited info,
+  else independently retries GET /info — a failed info fetch must never kill
+  the affordance. Two surfaces: always-available `#nextChip` in the toolbar
+  once next is known (label `▶ S{se}·E{n}`), plus the `.next-ep` player pill
+  5 min before end (`UP_NEXT_WINDOW_S = 300`) or on `episode-ended` — the pill
+  is deliberately small/translucent (hover to promote) so it doesn't disturb
+  the picture. Unparseable/current-last episodes resolve to nothing (never
+  eps[0]). Click navigates `#/watch/{type}/{id}/{nextEp}` → router remounts
+  fresh. Movies never show either surface.
 - Frontend perf invariants: Google Fonts link must stay `media="print" onload`
   (render-blocking fonts delay first paint); hls.js must stay lazy-loaded in
   `loadHls()` (watch view only — do NOT re-add the script tag to index.html);

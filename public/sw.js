@@ -5,11 +5,13 @@
 //  - navigations: network-first, fall back to the cached shell (offline)
 //  - static assets: cache-first
 //  - API + /play: NEVER cached (auth'd tokens, range requests, live data)
-const CACHE = 'myflixerz-v1';
-const SHELL = ['/', '/css/style.css', '/js/api.js', '/js/player.js', '/js/app.js', '/manifest.webmanifest', '/icons/icon.svg'];
+// Bump this name on every release that changes static assets — the activate
+// handler purges the old cache, so a stale SW cache can never outlive a deploy.
+const CACHE = 'myflixerz-v15';
+const SHELL = ['/', '/css/style.css', '/js/api.js', '/js/player.js', '/js/render.js', '/js/app.js', '/manifest.webmanifest', '/icons/icon.svg'];
 
-// everything the app fetches from our own API — network only
-const NETWORK_ONLY = /^\/(?:play|download|sources|servers|dubs|search|info|recent|trending|movies|tv|genre|top-imdb|health|movie\/embed|tv\/embed)(?:\/|\?|$)/;
+// everything the app fetches from our own API — network only.
+const NETWORK_ONLY = /^\/(?:play|download|sources|servers|subtitles|dubs|search|info|recent|trending|movies|tv|genre|top-imdb|health|movie\/embed|tv\/embed)(?:\/|\?|$)/;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

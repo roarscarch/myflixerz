@@ -1,6 +1,8 @@
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const cors = require('cors');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { Readable } = require('stream');
 const { spawn } = require('child_process');
@@ -34,9 +36,11 @@ function cacheSegment(key, data, type) {
   segmentCacheBytes += data.length;
 }
 const FlixHQ = require('./flixhq');
+const Render = require('./public/js/render.js'); // shared with app.js — markup never drifts
 
 const app = express();
 const flixhq = new FlixHQ();
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
 
 // Rate limiting — API metadata calls only. Static files and /play (which
 // streams HLS segments — hundreds per movie) must never count against it.
@@ -49,6 +53,7 @@ const limiter = rateLimit({
 });
 
 app.use(cors());
+app.use(compression()); // gzip/brotli on every response (JSON, HTML, static)
 app.use(express.json());
 
 // Health check for container orchestration — defined before the limiter so
@@ -57,7 +62,53 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: Math.round(process.uptime()), ts: Date.now() });
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// ---- SSR: pre-render the home view into the shell (instant first paint) ----
+// The rows + the movies-grid page 1 are fetched in-process (cached, parallel)
+// and injected into the HTML, so the landing page paints with zero client JS
+// and zero round-trips. Served before static/limiter like /health. Any
+// failure falls through to the plain client-rendered page — SSR is an
+// enhancement, never a gate.
+const norm = (d) => (Array.isArray(d) ? d : (d && d.results) || []);
+app.get('/', async (req, res, next) => {
+  try {
+    const [trendingMovies, trendingTv, imdb75, recent, topRated, browseMovies] = await Promise.all([
+      flixhq.fetchTrendingMovies(),
+      flixhq.fetchTrendingTvShows(),
+      flixhq.fetchTopIMDB('movie', 1, 7.5),
+      flixhq.fetchRecentMovies(),
+      flixhq.fetchTopIMDB('all', 1),
+      flixhq.fetchMoviesByPage(1),
+    ]);
+    const homeHtml = Render.homeView({
+      trendingMovies: norm(trendingMovies),
+      trendingTv: norm(trendingTv),
+      imdb75: norm(imdb75),
+      recent: norm(recent),
+      topRated: norm(topRated),
+    });
+    const initial = JSON.stringify({ browse: { movies: norm(browseMovies), imdb75: norm(imdb75) } });
+    const html = INDEX_HTML
+      .replace('<main id="view"></main>', `<main id="view" data-ssr-home>${homeHtml}</main>`)
+      .replace('</body>', `<script>window.__INITIAL__ = ${initial};</script></body>`);
+    res.set('Cache-Control', 'no-cache').type('html').send(html);
+  } catch (e) {
+    console.warn('SSR failed — serving client-rendered page:', e.message);
+    next();
+  }
+});
+
+app.use(
+  express.static(path.join(__dirname, 'public'), {
+    maxAge: '7d', // versioned assets (?v=N) are immutable; harmless for the rest
+    setHeaders(res, filePath) {
+      // sw.js must revalidate every load (stale SW = stale caches forever);
+      // index.html is revalidated so new ?v= references reach browsers fast
+      if (filePath.endsWith('sw.js') || filePath.endsWith('index.html')) {
+        res.setHeader('Cache-Control', 'no-cache');
+      }
+    },
+  })
+);
 app.use(limiter);
 
 // Add request logging middleware
@@ -155,6 +206,22 @@ app.get('/servers/:episodeId', async (req, res) => {
   }
 });
 
+// Subtitle tracks only — a SEPARATE endpoint so /sources stays stream-only and
+// answers as fast as possible. The browser fires both in parallel and attaches
+// tracks whenever these arrive (even several seconds after playback started).
+app.get('/subtitles/:episodeId', async (req, res) => {
+  try {
+    const { episodeId } = req.params;
+    const { mediaId } = req.query;
+    if (!mediaId) return res.status(400).json({ error: 'mediaId query parameter is required' });
+    if (!episodeId) return res.status(400).json({ error: 'Episode ID is required' });
+    const subtitles = await flixhq.fetchEpisodeSubtitles(episodeId, mediaId);
+    res.json({ subtitles });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Audio languages across dub-capable servers (populates the audio dropdown)
 app.get('/dubs/:episodeId', async (req, res) => {
   try {
@@ -247,8 +314,8 @@ app.get('/genre/:genre', async (req, res) => {
 // Top IMDB endpoint
 app.get('/top-imdb', async (req, res) => {
   try {
-    const { type = 'all', page = 1 } = req.query;
-    const results = await flixhq.fetchTopIMDB(type, parseInt(page));
+    const { type = 'all', page = 1, minVote } = req.query;
+    const results = await flixhq.fetchTopIMDB(type, parseInt(page), minVote ? parseFloat(minVote) : undefined);
     res.json(results);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -441,43 +508,87 @@ app.get('/play', async (req, res) => {
 });
 
 // Download endpoint — saves the current stream to disk.
-//  - direct sources (mp4/webm/…): streamed through with Content-Disposition
-//  - HLS (hls=1): remuxed by ffmpeg into a playable .mp4 — video copied
-//    (no re-encode), audio re-encoded to AAC for container compatibility,
-//    fragmented moov so a partial file is still playable
-// ffmpeg must be on PATH; without it HLS downloads 503 with a hint.
+//  - direct sources, no subs: streamed through (constant memory, no ffmpeg)
+//  - anything with subs= (or hls=1): remuxed by ffmpeg into a playable .mp4 —
+//    video copied (never re-encoded), audio re-encoded to AAC for HLS (copied
+//    for direct sources), subtitle tracks converted to mp4 text (mov_text),
+//    fragmented moov so a partial file is still playable.
+// `subs` = "url|label" pairs, comma-separated. If a subtitle input fails,
+// the download retries once without subs rather than dying.
 app.get('/download', (req, res) => {
-  const { url, ref, title, hls } = req.query;
+  const { url, ref, title, hls, subs } = req.query;
   if (!url) return res.status(400).json({ error: 'url query parameter is required' });
   if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Invalid url' });
   const referer = ref || 'https://peachify.top/';
-  const ext = hls === '1' ? 'mp4' : (path.extname(new URL(url).pathname).replace(/[^a-z0-9]/gi, '') || 'mp4');
-  const base = String(title || 'myflixerz-download')
+  const base = String(title || 'cinephiles-download')
     .replace(/[^\w\- ]+/g, '')
     .trim()
     .replace(/\s+/g, '-')
-    .slice(0, 80) || 'myflixerz-download';
+    .slice(0, 80) || 'cinephiles-download';
+  const tracks = String(subs || '')
+    .split(',')
+    .map((t, i) => {
+      const [u, ...rest] = t.split('|');
+      if (!u || !/^https?:\/\//i.test(u)) return null;
+      return { url: u, label: rest.join('|').slice(0, 60) || `Subtitle ${i + 1}` };
+    })
+    .filter(Boolean)
+    .slice(0, 12); // cap the track count — no point muxing 50 languages
+  const remux = hls === '1' || tracks.length > 0;
+
   res.set({
-    'Content-Disposition': `attachment; filename="${base}.${ext}"`,
+    'Content-Disposition': `attachment; filename="${base}.${remux ? 'mp4' : (path.extname(new URL(url).pathname).replace(/[^a-z0-9]/gi, '') || 'mp4')}"`,
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
   });
 
-  if (hls === '1') {
-    const ff = spawn(
-      'ffmpeg',
-      [
-        '-hide_banner', '-loglevel', 'error',
-        '-headers', `Referer: ${referer}\r\nUser-Agent: ${STREAM_UA}\r\n`,
-        '-i', url,
-        '-c:v', 'copy', '-c:a', 'aac',
-        '-movflags', 'frag_keyframe+empty_moov',
-        '-f', 'mp4', 'pipe:1',
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    let stderr = '';
-    let aborted = false;
+  if (!remux) {
+    // direct source, no subs: stream through like /play, flagged as a download
+    fetch(url, { headers: { Referer: referer, 'User-Agent': STREAM_UA } })
+      .then((up) => {
+        if (!up.ok && up.status !== 206) return res.status(up.status).json({ error: `Upstream ${up.status}` });
+        res.set('Content-Type', up.headers.get('content-type') || 'application/octet-stream');
+        const cl = up.headers.get('content-length');
+        if (cl) res.set('Content-Length', cl);
+        return new Promise((resolve, reject) => {
+          const body = Readable.fromWeb(up.body);
+          body.on('error', (e) => {
+            res.destroy();
+            reject(e);
+          });
+          res.on('close', resolve);
+          body.pipe(res);
+        });
+      })
+      .catch((e) => {
+        if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${e.message}` });
+      });
+    return;
+  }
+
+  res.set('Content-Type', 'video/mp4');
+  const headers = `Referer: ${referer}\r\nUser-Agent: ${STREAM_UA}\r\n`;
+  const buildArgs = (includeSubs) => {
+    const args = ['-hide_banner', '-loglevel', 'error', '-headers', headers, '-i', url];
+    if (includeSubs) for (const t of tracks) args.push('-i', t.url);
+    args.push('-map', '0:v:0', '-map', '0:a?');
+    if (includeSubs) tracks.forEach((_, i) => args.push('-map', `${i + 1}:0`));
+    args.push('-c:v', 'copy', '-c:a', hls === '1' ? 'aac' : 'copy');
+    if (includeSubs) {
+      args.push('-c:s', 'mov_text');
+      tracks.forEach((t, i) => args.push(`-metadata:s:s:${i}`, `title=${t.label}`));
+    }
+    args.push('-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4', 'pipe:1');
+    return args;
+  };
+
+  let stderr = '';
+  let aborted = false;
+  let ff = null;
+
+  const start = (includeSubs) => {
+    ff = spawn('ffmpeg', buildArgs(includeSubs), { stdio: ['ignore', 'pipe', 'pipe'] });
+    stderr = '';
     ff.stderr.on('data', (d) => (stderr = (stderr + d).slice(-2048)));
     ff.stdout.on('error', () => {});
     ff.on('error', (e) => {
@@ -486,44 +597,26 @@ app.get('/download', (req, res) => {
       res.status(e.code === 'ENOENT' ? 503 : 502).json({
         error:
           e.code === 'ENOENT'
-            ? 'ffmpeg is not installed on this server — HLS downloads need it (sudo apt install ffmpeg)'
+            ? 'ffmpeg is not installed on this server — downloads with subtitles need it (sudo apt install ffmpeg)'
             : `ffmpeg failed to start: ${e.message}`,
       });
     });
     ff.on('close', (code) => {
       if (aborted) return;
       if (res.headersSent) return res.end();
+      // failed before producing output: if subtitle inputs were involved,
+      // one of them is probably dead — retry once without them
+      if (includeSubs) return start(false);
       res.status(502).json({ error: `ffmpeg exited before producing output (code ${code}): ${stderr.slice(-400)}` });
     });
-    res.on('close', () => {
-      aborted = true;
-      if (!ff.killed) ff.kill();
-    });
-    res.set('Content-Type', 'video/mp4');
     ff.stdout.pipe(res);
-    return;
-  }
+  };
 
-  // direct source: stream through like /play, flagged as a download
-  fetch(url, { headers: { Referer: referer, 'User-Agent': STREAM_UA } })
-    .then((up) => {
-      if (!up.ok && up.status !== 206) return res.status(up.status).json({ error: `Upstream ${up.status}` });
-      res.set('Content-Type', up.headers.get('content-type') || 'application/octet-stream');
-      const cl = up.headers.get('content-length');
-      if (cl) res.set('Content-Length', cl);
-      return new Promise((resolve, reject) => {
-        const body = Readable.fromWeb(up.body);
-        body.on('error', (e) => {
-          res.destroy();
-          reject(e);
-        });
-        res.on('close', resolve);
-        body.pipe(res);
-      });
-    })
-    .catch((e) => {
-      if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${e.message}` });
-    });
+  res.on('close', () => {
+    aborted = true;
+    if (ff && !ff.killed) ff.kill();
+  });
+  start(tracks.length > 0);
 });
 
 // SPA fallback: unknown GETs serve the frontend
@@ -535,6 +628,11 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+// Vercel serverless: @vercel/node needs the app exported. Locally we listen
+// with Express directly; the lambda bridge uses the export instead.
+module.exports = app;
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+}
