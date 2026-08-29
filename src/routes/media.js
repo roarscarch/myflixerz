@@ -58,12 +58,14 @@ module.exports = function mediaRoutes(tmdb) {
       }
       const skipList = skip ? String(skip).split(',').map((s) => s.trim()).filter(Boolean) : [];
       const sources = await tmdb.fetchEpisodeSources(episodeId, mediaId, server, skipList);
-      if (!sources) {
-        return res.status(404).json({ error: 'Sources not found' });
+      if (!sources || (sources.sources && sources.sources.length === 0)) {
+        // Graceful empty result: client handles fallback; no raw server errors shown.
+        return res.status(200).json({ provider: null, sources: [], subtitles: [], message: 'No sources available — try another server' });
       }
       res.json(sources);
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      // Never surface raw provider errors to the user.
+      res.status(200).json({ provider: null, sources: [], subtitles: [], message: "No sources available" });
     }
   });
 

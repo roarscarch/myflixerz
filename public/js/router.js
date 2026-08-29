@@ -162,7 +162,7 @@
       } catch (e) {
         if (!ac.signal.aborted) searchDropdown.classList.remove('open');
       }
-    }, 220);
+    }, 60);
   }
 
   function closeSearch() {

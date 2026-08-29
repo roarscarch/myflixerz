@@ -477,9 +477,9 @@ async function resolveStream({ type, id, season, episode, server, skip }) {
   const out = await autoRace(pOrder, vOrder, key, { type, id, season, episode });
   if (out.won) return out.result;
 
-  const pe = out.lastErr.peachify || 'no healthy provider';
-  const ve = out.lastErr.vidnest || 'no healthy provider';
-  throw new Error(`No source found on any provider (peachify: ${pe}; vidnest: ${ve})`);
+  // All providers failed gracefully — return empty so the client can fall back
+  // to the next server or show a clean message instead of a raw error.
+  return { provider: null, sources: [], subtitles: [] };
 }
 
 // Embed providers wrap real streams in relay endpoints: Peachify uses
