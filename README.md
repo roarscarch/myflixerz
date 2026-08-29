@@ -479,25 +479,14 @@ drift instantly.
 Three options, same code:
 
 - **Docker (recommended):** `docker compose up -d --build` → port 3000.
-  `Dockerfile` uses `node:20-alpine` + `npm ci --omit=dev`; `TMDB_API_KEY`
-  overridable via env; `restart: unless-stopped`; probe `GET /health`.
+  `Dockerfile` uses `node:20-alpine` + `npm ci --omit=dev`; Environment variables overridable via `.env` or container env; `restart: unless-stopped`; probe `GET /health`.
 - **systemd:** `deploy/myflixerz.service` — adjust `WorkingDirectory` and
   `ExecStart`, install under `/etc/systemd/system/`, then
   `systemctl enable --now myflixerz`.
 - **Vercel:** `vercel.json` builds the whole app as a single `@vercel/node`
-  function from `server.js`; all routes fall through to it. The rate limiter
-  and `/play` proxy work there unchanged.
-  **Deploy steps (token from `.env.local`):**
-  ```bash
-  # Source the token file created by `vercel login` (or copied from dashboard)
-  . .env.local && export VERCEL_OIDC_TOKEN
-  # Deploy
-  npx vercel --prod
-  ```
-  Where to get the token if `.env.local` is missing:
-  - `vercel login` (auto-creates `.env.local`), or
-  - Vercel dashboard (`cinephiles-areana`) → Settings → Environment Variables.
-  Deployed URL: `https://cinephiles-areana.vercel.app` (aliased from build output).
+  function from `server.js`. Environment variables (`TMDB_API_KEY` and deploy
+  credentials) must be configured in the Vercel dashboard or via `vercel env`.
+  Refer to the private secrets repository for deployment tokens and keys.
 
 
 For a VPS behind nginx: plain `node server.js` with `proxy_buffering off` for
