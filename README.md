@@ -1,8 +1,9 @@
-# MyFlixz
+# Cinephiles Areana — NO ADS · NO RESTRICTIONS · NO PAYMENT · COMPLETELY OPEN SOURCE · 20X VOLUME · ENGLISH SUBTITLES SUPPORTED · FREE MOVIES / SERIES / DOCUMENTARIES
 
-Self-hosted streaming frontend. The browser never touches the internet: every
-embed API call, decrypt, and stream fetch happens server-side, and the frontend
-talks only to our own Express server on `localhost`.
+F*CK AMAZON. F*CK NETFLIX. Cinephiles areana.
+
+Self-hosted streaming frontend. Zero scraping, zero browser automation in runtime. Every stream fetched server-side via Peachify + Vidnest embed APIs (AES/GCM + base64 decoded in `extractor.js`). Browser talks only to localhost. English subtitles via SubDL + OpenSubtitles. Play any movie/series instantly — no sign-up, no tracking, no paywall.
+
 
 Playback is sourced from **two embed families** — Peachify (5 internal
 providers) and Vidnest (5 providers) — plus TMDB for all metadata and two
