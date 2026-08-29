@@ -19,6 +19,7 @@
 // vidify (522), vidcore/vidfast (API 500s + player is bot-gated; shared code).
 // Response time: ~1-2s per title (vs ~45s with a headless browser).
 const crypto = require('crypto');
+const { httpClient } = require('../utils/http');
 
 const PEACHIFY_API = 'https://x.eat-peach.sbs';
 const PEACHIFY_KEY_HEX = '';
@@ -132,15 +133,18 @@ function decryptPayload(payload) {
 async function fetchProvider(provider, type, id, season, episode) {
   let url = `${PEACHIFY_API}/${provider.path}/${type}/${id}`;
   if (type === 'tv') url += `/${season}/${episode}`;
-  const res = await withTimeout(
-    fetch(url, { headers: { Referer: PEACHIFY_REFERER } }),
-    PROBE_TIMEOUT_MS,
-    `peachify ${provider.name}`
-  );
-  if (!res.ok) throw new Error(`peachify ${provider.name} API ${res.status}`);
-  const json = await res.json();
-  if (json.isEncrypted) return decryptPayload(json.data);
-  return json;
+  try {
+    const res = await httpClient.get(url, {
+      headers: { Referer: PEACHIFY_REFERER },
+      timeout: PROBE_TIMEOUT_MS,
+    });
+    const json = res.data;
+    if (json && json.isEncrypted) return decryptPayload(json.data);
+    return json;
+  } catch (err) {
+    const status = err.response ? err.response.status : '';
+    throw new Error(`peachify ${provider.name} API ${status || err.message}`);
+  }
 }
 
 async function fetchSubtitles(type, id, season, episode) {
@@ -149,19 +153,11 @@ async function fetchSubtitles(type, id, season, episode) {
   try {
     let url = `${PEACHIFY_API}/subs/${type}/${id}`;
     if (type === 'tv') url += `/${season}/${episode}`;
-    // bounded like every other upstream call — an unbounded hang here would
-    // stall the whole /sources response even after the stream resolved. 3s:
-    // subs are ENRICHMENT (video plays fine without them) and must never gate
-    // playback past the 4s provider-probe ceiling.
-    const res = await withTimeout(
-      fetch(url, { headers: { Referer: PEACHIFY_REFERER } }),
-      3000,
-      'peachify subs'
-    );
-    // Normalize to a stable shape so the player's loadSubtitle always gets a
-    // url (raw entries with only `file`/`src` used to flow through with an
-    // undefined url — one reason subs showed as "available" but never played).
-    const raw = res.ok ? await res.json() : [];
+    const res = await httpClient.get(url, {
+      headers: { Referer: PEACHIFY_REFERER },
+      timeout: 3000,
+    });
+    const raw = res.data || [];
     const subs = (Array.isArray(raw) ? raw : [])
       .map((s) => ({
         url: s.url || s.file || s.src,
@@ -195,20 +191,21 @@ async function fetchVidnestProvider(provider, type, id, season, episode) {
   const slug = provider.slug || provider.name;
   let url = `${VIDNEST_API}/${slug}/${type}/${id}`;
   if (type === 'tv') url += `/${season}/${episode}`;
-  const res = await withTimeout(
-    fetch(url, {
+  try {
+    const res = await httpClient.get(url, {
       headers: { Referer: VIDNEST_REFERER, 'User-Agent': STREAM_UA },
-    }),
-    PROBE_TIMEOUT_MS,
-    `vidnest ${provider.name}`
-  );
-  if (res.status === 502 || res.status === 404) {
-    throw new Error(`vidnest ${provider.name}: no source (${res.status})`);
+      timeout: PROBE_TIMEOUT_MS,
+    });
+    const json = res.data;
+    if (!json || !json.data) throw new Error(`vidnest ${provider.name}: unexpected response`);
+    return JSON.parse(vidnestDecode(json.data));
+  } catch (err) {
+    const status = err.response ? err.response.status : '';
+    if (status === 502 || status === 404) {
+      throw new Error(`vidnest ${provider.name}: no source (${status})`);
+    }
+    throw new Error(`vidnest ${provider.name} API ${status || err.message}`);
   }
-  if (!res.ok) throw new Error(`vidnest ${provider.name} API ${res.status}`);
-  const json = await res.json();
-  if (!json.data) throw new Error(`vidnest ${provider.name}: unexpected response`);
-  return JSON.parse(vidnestDecode(json.data));
 }
 
 function vidnestToResult(provider, data) {
@@ -287,9 +284,8 @@ async function fetchVidnestSubtitles(type, id, season, episode) {
   try {
     let url = `https://sub.vdrk.site/v2/${type}/${id}`;
     if (type === 'tv') url += `/${season}/${episode}`;
-    // bounded like every other upstream call; 3s budget — see peachify subs note
-    const res = await withTimeout(fetch(url), 3000, 'vidnest subs');
-    const list = res.ok ? await res.json() : [];
+    const res = await httpClient.get(url, { timeout: 3000 });
+    const list = Array.isArray(res.data) ? res.data : [];
     const subs = list
       .map((s) => ({ url: s.file || s.url, label: s.label, lang: s.label || null }))
       .filter((s) => s.url);

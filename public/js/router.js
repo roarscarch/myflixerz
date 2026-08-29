@@ -81,9 +81,23 @@
     }
   }
 
+  const prefetched = new Set();
+  function prefetchMedia(href) {
+    if (!href || prefetched.has(href)) return;
+    prefetched.add(href);
+    const m = href.match(/^#\/(movie|tv)\/(\d+)/);
+    if (m) {
+      const mediaId = `${m[1]}/${m[2]}`;
+      API.info(mediaId).catch(() => {});
+      API.sources(mediaId, '1-1').catch(() => {});
+    }
+  }
+
   function bindCards(scope) {
     scope.querySelectorAll('.card[data-href]').forEach((c) => {
       c.addEventListener('click', () => (location.hash = c.dataset.href));
+      c.addEventListener('mouseenter', () => prefetchMedia(c.dataset.href), { passive: true, once: true });
+      c.addEventListener('touchstart', () => prefetchMedia(c.dataset.href), { passive: true, once: true });
     });
   }
 

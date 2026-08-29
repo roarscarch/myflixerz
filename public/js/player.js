@@ -339,10 +339,16 @@ const Player = (() => {
       }
 
       if (src.isM3U8 && window.Hls && Hls.isSupported()) {
-        // Short retries so dead sources fail fast and _fallbackNext/_autoAdvance kick in
+        // High-performance HLS config: Worker-offloaded demuxing, start prefetch, and generous back-buffer
         this.hls = new Hls({
           enableWorker: true,
-          maxBufferLength: 40,
+          lowLatencyMode: true,
+          backBufferLength: 90,
+          maxBufferLength: 35,
+          maxMaxBufferLength: 60,
+          maxBufferHole: 0.5,
+          startFragPrefetch: true,
+          highBufferWatchdogPeriod: 2,
           fragLoadingMaxRetry: 2,
           fragLoadingRetryDelay: 1000,
           levelLoadingMaxRetry: 2,

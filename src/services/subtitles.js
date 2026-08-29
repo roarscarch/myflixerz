@@ -16,6 +16,9 @@
 // Degrades to [] on any missing config / network / auth failure so the app's
 // existing peachify + vidnest subtitle sources remain the silent fallback.
 const axios = require('axios');
+const { httpAgent, httpsAgent } = require('../utils/http');
+
+const osClient = axios.create({ httpAgent, httpsAgent, timeout: 10000 });
 
 const OS_BASE = 'https://api.opensubtitles.com/api/v1';
 const OS_UA =
@@ -38,12 +41,11 @@ async function login() {
   const password = process.env.OPENSUBTITLES_PASSWORD;
   if (!key || !username || !password) throw new Error('opensubtitles credentials missing');
   if (loginToken && Date.now() < loginExp) return loginToken;
-  const r = await axios.post(
+  const r = await osClient.post(
     `${OS_BASE}/login`,
     { username, password },
     {
       headers: { 'Api-Key': key, 'User-Agent': OS_UA, 'Content-Type': 'application/json' },
-      timeout: 10000,
     }
   );
   loginToken = r.data && r.data.token;
@@ -63,10 +65,9 @@ async function searchEnglish({ imdbId, season, episode }) {
     params.season_number = Number(season);
     params.episode_number = Number(episode);
   }
-  const r = await axios.get(`${OS_BASE}/subtitles`, {
+  const r = await osClient.get(`${OS_BASE}/subtitles`, {
     params,
     headers: { 'Api-Key': key, 'User-Agent': OS_UA },
-    timeout: 10000,
   });
   const rows = (r.data && r.data.data) || [];
   return rows
@@ -86,7 +87,7 @@ async function searchEnglish({ imdbId, season, episode }) {
 async function download(fileId) {
   const key = process.env.OPENSUBTITLES_API_KEY;
   const token = await login();
-  const r = await axios.post(
+  const r = await osClient.post(
     `${OS_BASE}/download`,
     { file_id: fileId },
     {
@@ -96,7 +97,6 @@ async function download(fileId) {
         'User-Agent': OS_UA,
         'Content-Type': 'application/json',
       },
-      timeout: 10000,
     }
   );
   return r.data && r.data.link;

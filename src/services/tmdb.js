@@ -2,6 +2,7 @@ const axios = require('axios');
 const { TvType } = require('../utils/constants');
 const { resolveStream, fetchSubtitles, fetchVidnestSubtitles, PROVIDERS, VIDNEST_PROVIDERS } = require('./extractor');
 const { fetchEnglishSubtitles } = require('./subtitles'); // primary English subtitle source
+const { httpAgent, httpsAgent } = require('../utils/http');
 
 // Public TMDB key used by myflixerfree.to (override via TMDB_API_KEY env).
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
@@ -28,7 +29,13 @@ class FlixHQ {
   constructor() {
     this.name = 'MyFlixHQ';
     this.baseUrl = 'https://myflixerfree.to';
-    this.tmdb = axios.create({ baseURL: TMDB_BASE, params: { api_key: TMDB_API_KEY } });
+    this.tmdb = axios.create({
+      baseURL: TMDB_BASE,
+      params: { api_key: TMDB_API_KEY },
+      httpAgent,
+      httpsAgent,
+      timeout: 12000,
+    });
     this._genresCache = null;
     this._cache = new Map(); // { key → { exp, promise } } TTL cache, in-flight dedupe
   }
