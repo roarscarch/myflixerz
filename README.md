@@ -8,11 +8,6 @@ Completely open source · 20× volume · English subtitles supported · free mov
 
 </div>
 
-> **Disclaimer:** This project does **not** host or distribute any copyrighted
-> content. It is a thin frontend that fetches playback URLs from publicly
-> available embed APIs and proxies them through your own server so the browser
-> never contacts the upstream hosts directly.
-
 ## What it is
 
 Cinephiles Areana is a single-process **self-hosted streaming app**. The user
