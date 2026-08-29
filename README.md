@@ -235,16 +235,10 @@ labels; the slug after the host is what the API expects.
 > — `toResult()` unwraps those into the real URL + `{Origin, Referer}` headers so
 > playback rides our `/play` proxy (which now forwards the `origin` query param).
 
-**Legacy response payload (old host):** `{"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}`
-where the three parts are base64url (no padding) and separated by `.`.
-
-**Decryption:** AES-256-GCM, key hex:
-```
-
-```
-(iv and tag are raw bytes from base64url decode; `authTagLength: 16`.)
-
-**Decrypted shape:** `{ sources: [{ url, headers?, dub?, quality? }] }`
+**Cipher & response details:** Refer to the private secrets repository
+(`https://github.com/roarscarch/cinephile-areana-secrets`) for the AES-256-GCM
+key, base64url payload format, and provider mappings. The public repo only
+contains the normalized `resolveStream()` pipeline — never cipher constants.`
 
 - `dub` — the audio language label. Values seen: `English`, `Hindi`,
   `Tamil`, `Telugu`, `Original Audio`, `French`, `Russian`, `Spanish`,
@@ -272,14 +266,8 @@ shapes.
 **Request:** `GET https://new.vidnest.fun/{provider}/{movie|tv}/{id}[/{s}/{e}]`
 with `Referer: https://vidnest.fun/` and a desktop Chrome UA.
 
-**Response payload:** `{"encrypted":true,"data":"<encoded>"}` — the data uses a
-**custom base64 alphabet**, not the standard one:
-
-```
-
-```
-(61 chars + `=` padding; the standard alphabet `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/` maps position-wise onto it.) Decode in
-`vidnestDecode()` in `extractor.js`.
+**Response payload:** Encrypted data uses a custom base64 alphabet
+(refer to private secrets repo for the exact alphabet and decoder fixtures).
 
 **The 3 decrypted shapes** — a resolver must handle all of them; `vidnestToResult()`
 normalizes each into our standard `{url, isM3U8, headers, referer, label}`:
@@ -429,7 +417,7 @@ redesigns.
 
 | Upstream change | What you touch | Architecture change? |
 |---|---|---|
-| Encryption key / alphabet rotated | `PEACHIFY_KEY_HEX` / `VIDNEST_ALPHABET` in `extractor.js` | No |
+| Encryption key / alphabet rotated | Refer to private secrets repo | No |
 | JSON response shape changed | `toResult` / `vidnestToResult` normalizers | No |
 | New CDN host for streams | **Nothing** — unknown hosts default to `/play` automatically | No |
 | New CDN host that is CORS-open | Optional: add to `PROXY_HOSTS` in `player.js` (skips proxy) | No |
