@@ -1,4 +1,4 @@
-# CLAUDE.md — MyFlixz invariants
+# CONTRIBUTING.md — Cinephiles architecture & invariants
 
 Rules that must never be broken when changing this codebase. The README has the
 full architecture, server tables, and the add-a-server recipe — read it first.
@@ -6,9 +6,9 @@ full architecture, server tables, and the add-a-server recipe — read it first.
 ## The stack
 
 - **No scraping, no browser in the runtime app.** Metadata comes from TMDB;
-  streams come from two embed JSON APIs decrypted in `extractor.js`. Playwright
+  streams come from two embed JSON APIs decrypted in `src/services/extractor.js`. Playwright
   is a devDependency only, used for UI smoke tests written to `/tmp` (never
-  require it in server/flixhq/extractor).
+  require it in server/tmdb/extractor).
 - Browser talks **only to localhost** (our Express server). Every external
   request is server-side.
 
@@ -40,9 +40,9 @@ full architecture, server tables, and the add-a-server recipe — read it first.
   URI=`, absolute) to `/play`, streams back with `Access-Control-Allow-Origin: *`.
 - Rate limiter (600/15min) must keep skipping `/play`; static is served before
   the limiter.
-- **OpenSubtitles EN subs** (`opensubs.js`): the primary English subtitle source,
+- **OpenSubtitles EN subs** (`src/services/subtitles.js`): the primary English subtitle source,
   keyed by the TMDB imdb_id (via `/external_ids`, long-cached). Served by
-  **`GET /subtitles/:episodeId?mediaId=`** (`flixhq.fetchEpisodeSubtitles`) —
+  **`GET /subtitles/:episodeId?mediaId=`** (`tmdb.fetchEpisodeSubtitles`) —
   the browser fires it IN PARALLEL with playback and attaches tracks late;
   `/sources` is stream-only so a sick sub-API can never delay first frame.
   Requires `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME`,
@@ -54,10 +54,10 @@ full architecture, server tables, and the add-a-server recipe — read it first.
 
 ## Wiring a new server (4 touch points)
 
-1. `extractor.js` — decoder + resolver + cache Map + entry in `PROVIDERS`/`VIDNEST_PROVIDERS` + branch in `resolveStream` dispatch (vidnest names first, then peachify aliases, then auto = one CONCURRENT probe wave over each family's healthy providers — peachify wave first, vidnest wave as fallback; priority pick prefers a sub-carrying provider, else the first stream; failures mark providers dead 30 s).
-2. `flixhq.js` — nothing (SERVERS builds from those arrays).
-3. `app.js` — friendly label in `PROVIDER_LABELS`.
-4. `player.js` — position in `SERVER_FALLBACK_ORDER`.
+1. `src/services/extractor.js` — decoder + resolver + cache Map + entry in `PROVIDERS`/`VIDNEST_PROVIDERS` + branch in `resolveStream` dispatch (vidnest names first, then peachify aliases, then auto = one CONCURRENT probe wave over each family's healthy providers — peachify wave first, vidnest wave as fallback; priority pick prefers a sub-carrying provider, else the first stream; failures mark providers dead 30 s).
+2. `src/services/tmdb.js` — nothing (SERVERS builds from those arrays).
+3. `public/js/router.js` — friendly label in `PROVIDER_LABELS`.
+4. `public/js/player.js` — position in `SERVER_FALLBACK_ORDER`.
 
 Verify live via `curl "localhost:3000/sources/1-1?mediaId=movie/603&server=<name>"`
 before UI work.

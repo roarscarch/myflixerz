@@ -46,11 +46,11 @@
   <!-- hls.js is NOT here — it's lazy-loaded only when a watch page opens
        (browse/search pages skip ~400KB of parsing) -->
   <!-- ?v= busts the service-worker/HTTP caches on release — bump alongside sw.js CACHE -->
-  <script src="/js/api.js?v=15"></script>
-  <script src="/js/player.js?v=15"></script>
-  <!-- render.js must load before app.js (shared SSR/client markup helpers) -->
-  <script src="/js/render.js?v=15"></script>
-  <script src="/js/app.js?v=15"></script>
+  <script src="/js/api.js?v=16"></script>
+  <script src="/js/player.js?v=16"></script>
+  <!-- render.js must load before router.js (shared SSR/client markup helpers) -->
+  <script src="/js/render.js?v=16"></script>
+  <script src="/js/router.js?v=16"></script>
   <script>
     // PWA: register the service worker (installable app + cached shell)
     if ('serviceWorker' in navigator) {

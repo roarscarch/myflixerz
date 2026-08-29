@@ -1,7 +1,7 @@
 const axios = require('axios');
-const { TvType } = require('./models');
+const { TvType } = require('../utils/constants');
 const { resolveStream, fetchSubtitles, fetchVidnestSubtitles, PROVIDERS, VIDNEST_PROVIDERS } = require('./extractor');
-const { fetchEnglishSubtitles } = require('./opensubs'); // primary English subtitle source
+const { fetchEnglishSubtitles } = require('./subtitles'); // primary English subtitle source
 
 // Public TMDB key used by myflixerfree.to (override via TMDB_API_KEY env).
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';

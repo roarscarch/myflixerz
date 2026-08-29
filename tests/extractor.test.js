@@ -12,7 +12,7 @@ const {
   toResult,
   PEACHIFY_KEY_HEX,
   VIDNEST_ALPHABET,
-} = require('../extractor');
+} = require('../src/services/extractor');
 
 const STANDARD_B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const b64url = (buf) => buf.toString('base64url');
