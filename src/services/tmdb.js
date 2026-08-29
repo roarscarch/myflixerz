@@ -279,16 +279,11 @@ class FlixHQ {
   async fetchEpisodeSubtitles(episodeId, mediaId) {
     const { type, id, season, episode } = this._parseMedia(episodeId, mediaId);
     const budgetMs = 6000;
-    const imdbP = this._imdbId(type, id);
+    const imdbId = await this._imdbId(type, id);
     const [subs, vsubs, osSubs] = await Promise.all([
       withDeadline(fetchSubtitles(type, id, season, episode), budgetMs),
       withDeadline(fetchVidnestSubtitles(type, id, season, episode), budgetMs),
-      withDeadline(
-        imdbP.then((imdbId) =>
-          imdbId ? fetchEnglishSubtitles({ type, imdbId, season, episode }) : []
-        ),
-        budgetMs
-      ),
+      imdbId ? withDeadline(fetchEnglishSubtitles({ type, imdbId, season, episode }), budgetMs) : [],
     ]);
     return this._mergeSubtitles(osSubs, subs, vsubs);
   }

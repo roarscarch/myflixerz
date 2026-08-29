@@ -87,6 +87,24 @@ module.exports = function mediaRoutes(tmdb) {
     }
   });
 
+  // Serve unzipped & WebVTT-converted SubDL subtitles
+  router.get('/subtitles/subdl', async (req, res) => {
+    try {
+      const { zip, ep } = req.query;
+      if (!zip) return res.status(400).json({ error: 'zip parameter is required' });
+      const { fetchSubdlVtt } = require('../services/subtitles');
+      const vtt = await fetchSubdlVtt(zip, ep);
+      res.set({
+        'Content-Type': 'text/vtt; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=86400',
+      });
+      res.send(vtt);
+    } catch (error) {
+      res.status(502).json({ error: `Subtitle fetch error: ${error.message}` });
+    }
+  });
+
   // Subtitle tracks only — a SEPARATE endpoint so /sources stays stream-only and
   // answers as fast as possible. The browser fires both in parallel and attaches
   // tracks whenever these arrive (even several seconds after playback started).
