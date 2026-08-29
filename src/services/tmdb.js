@@ -4,8 +4,10 @@ const { resolveStream, fetchSubtitles, fetchVidnestSubtitles, PROVIDERS, VIDNEST
 const { fetchEnglishSubtitles } = require('./subtitles'); // primary English subtitle source
 const { httpAgent, httpsAgent } = require('../utils/http');
 
-// Public TMDB key used by myflixerfree.to (override via TMDB_API_KEY env).
-const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+if (!TMDB_API_KEY) {
+  throw new Error("TMDB_API_KEY environment variable is required. Set it via .env.local or Vercel dashboard.");
+}
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 

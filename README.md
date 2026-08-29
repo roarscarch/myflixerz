@@ -487,6 +487,18 @@ Three options, same code:
 - **Vercel:** `vercel.json` builds the whole app as a single `@vercel/node`
   function from `server.js`; all routes fall through to it. The rate limiter
   and `/play` proxy work there unchanged.
+  **Deploy steps (token from `.env.local`):**
+  ```bash
+  # Source the token file created by `vercel login` (or copied from dashboard)
+  . .env.local && export VERCEL_OIDC_TOKEN
+  # Deploy
+  npx vercel --prod
+  ```
+  Where to get the token if `.env.local` is missing:
+  - `vercel login` (auto-creates `.env.local`), or
+  - Vercel dashboard (`cinephiles-areana`) → Settings → Environment Variables.
+  Deployed URL: `https://cinephiles-areana.vercel.app` (aliased from build output).
+
 
 For a VPS behind nginx: plain `node server.js` with `proxy_buffering off` for
 `/play` if you see stutter. `/play` streams with constant memory (piped, not
