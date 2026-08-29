@@ -14,12 +14,15 @@ full architecture, server tables, and the add-a-server recipe — read it first.
 
 ## Cipher facts (do not "rediscover")
 
-Upstream cipher details (Peachify AES-256-GCM, Vidnest custom base64) and
-provider mappings are stored in the private secrets repository. Refer to
-`https://github.com/roarscarch/cinephile-areana-secrets` for the key hex,
-alphabet strings, and decoder fixtures. The public repo contains only the
-normalized `resolveStream` interface and `/play` contract — never the
-actual cipher constants.
+Upstream payloads are protected with two ciphers, both handled in
+`src/services/extractor.js`: Peachify responses are AES-256-GCM encrypted
+(segments are `iv.ciphertext.authTag`, each base64url), and Vidnest responses
+use a custom-alphabet encoding (`vidnestDecode`). The cipher constants
+themselves (the AES key and the custom alphabet) are **deploy-time configuration
+injected via environment variables** — see `.env.example` for the variables the
+server requires. The public repo ships only the normalized `resolveStream`
+interface and the `/play` contract; the cipher constants are supplied by the
+operator at deploy time and are never committed.
 
 ## Streaming rules
 
@@ -38,8 +41,8 @@ actual cipher constants.
   the browser fires it IN PARALLEL with playback and attaches tracks late;
   `/sources` is stream-only so a sick sub-API can never delay first frame.
   Requires `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME`,
-  `OPENSUBTITLES_PASSWORD` env vars; unset/bad creds → `[]`, and the
-  peachify/vidnest title APIs remain the fallback. Only ENGLISH tracks are
+  `OPENSUBTITLES_PASSWORD` env vars; if any are unset or invalid, the call
+  returns `[]` and the peachify/vidnest title APIs remain the fallback. Only ENGLISH tracks are
   surfaced: OS/SubDL results are EN by API contract (`languages: 'en'`) and
   pass through; built-in peachify/vidnest tracks are filtered to EN by
   `_mergeSubtitles`. All calls go to

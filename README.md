@@ -174,8 +174,8 @@ npm start        # or: node server.js
 # → http://localhost:3000
 ```
 
-Copy the template and fill in real values (see the **private secrets repo**
-for the actual cipher constants):
+Copy the template and fill in real values (see `.env.example` for the
+required variables):
 
 ```bash
 cp .env.example .env.local
@@ -267,10 +267,12 @@ labels; the slug after the host is what the API expects.
 > — `toResult()` unwraps those into the real URL + `{Origin, Referer}` headers so
 > playback rides our `/play` proxy (which now forwards the `origin` query param).
 
-**Cipher & response details:** Refer to the private secrets repository
-(`https://github.com/roarscarch/cinephile-areana-secrets`) for the AES-256-GCM
-key, base64url payload format, and provider mappings. The public repo only
-contains the normalized `resolveStream()` pipeline — never cipher constants.`
+**Cipher & response format:** Peachify payloads are AES-256-GCM encrypted as
+`{iv}.{ciphertext}.{authTag}`, each segment base64url — decrypted in
+`decryptPayload()` (`extractor.js`) using the AES key supplied via the
+`PEACHIFY_KEY_HEX` env var. The public repo contains only the normalized
+`resolveStream()` pipeline — the cipher constant itself is injected at deploy
+time (see `.env.example`) and is never committed.
 
 - `dub` — the audio language label. Values seen: `English`, `Hindi`,
   `Tamil`, `Telugu`, `Original Audio`, `French`, `Russian`, `Spanish`,
@@ -298,8 +300,9 @@ shapes.
 **Request:** `GET https://new.vidnest.fun/{provider}/{movie|tv}/{id}[/{s}/{e}]`
 with `Referer: https://vidnest.fun/` and a desktop Chrome UA.
 
-**Response payload:** Encrypted data uses a custom base64 alphabet
-(refer to private secrets repo for the exact alphabet and decoder fixtures).
+**Response payload:** Encrypted data uses a custom base64 alphabet supplied via
+the `VIDNEST_ALPHABET` env var — the decoder is `vidnestDecode()` in
+`extractor.js` (see §15).
 
 **The 3 decrypted shapes** — a resolver must handle all of them; `vidnestToResult()`
 normalizes each into our standard `{url, isM3U8, headers, referer, label}`:
@@ -449,7 +452,7 @@ redesigns.
 
 | Upstream change | What you touch | Architecture change? |
 |---|---|---|
-| Encryption key / alphabet rotated | Refer to private secrets repo | No |
+| Encryption key / alphabet rotated | Redeploy with new `PEACHIFY_KEY_HEX` / `VIDNEST_ALPHABET` env vars | No |
 | JSON response shape changed | `toResult` / `vidnestToResult` normalizers | No |
 | New CDN host for streams | **Nothing** — unknown hosts default to `/play` automatically | No |
 | New CDN host that is CORS-open | Optional: add to `PROXY_HOSTS` in `player.js` (skips proxy) | No |
@@ -505,8 +508,8 @@ Three options, same code:
   `systemctl enable --now myflixerz`.
 - **Vercel:** `vercel.json` builds the whole app as a single `@vercel/node`
   function from `server.js`. Environment variables (`TMDB_API_KEY` and deploy
-  credentials) must be configured in the Vercel dashboard or via `vercel env`.
-  Refer to the private secrets repository for deployment tokens and keys.
+    credentials) must be configured in the Vercel dashboard or via `vercel env`
+  before deploying. Provide the same variables documented in `.env.example`.
 
 
 For a VPS behind nginx: plain `node server.js` with `proxy_buffering off` for
@@ -515,59 +518,49 @@ buffered — a 2 GB movie no longer costs 2 GB of RAM).
 
 ---
 
-## 15. Bonus — Payload decryption internals (how the "crack layer" works)
+## 15. Bonus - Payload decryption internals
 
-This section documents the *mechanism* — it intentionally does **not** ship
-cipher constants. The actual `PEACHIFY_KEY_HEX` and `VIDNEST_ALPHABET` values
-live only in the private secrets repo
-(`https://github.com/roarscarch/cinephile-areana-secrets`) and are injected at
-runtime via `process.env` (see `.env.example`). Rotating them is a deploy-time
-operation — the public repo contains zero hard-coded keys.
+A maintainer reference for *how* encrypted payloads are decoded - not a
+cipher-constant cookbook. The AES key (`PEACHIFY_KEY_HEX`) and custom alphabet
+(`VIDNEST_ALPHABET`) are deploy-time configuration injected via environment
+variables (see `.env.example`); they are never read from committed source.
 
 ### Two families, two decoders (`extractor.js`)
 
-**Peachify (`x.eat-peach.sbs`) — AES-256-GCM.** Requests return
-`{ "isEncrypted": true, "data": "<iv>.<ciphertext>.<authTag>" }` where each
-segment is **base64url**. Decryption:
+**Peachify - AES-256-GCM.** Responses come back as
+`{ "isEncrypted": true, "data": "<iv>.<ciphertext>.<authTag>" }`, each segment
+**base64url**. Decryption (`decryptPayload`):
 
-1. Split `data` on `.` → `[iv, ciphertext, authTag]`.
-2. `b64url()` helper decodes each piece (it's plain base64 with `-`/`_` swapped
-   to `+`/`/` — line 72 of `extractor.js`).
+1. Split `data` on `.` -> `[iv, ciphertext, authTag]`.
+2. `b64url()` helper decodes each piece (plain base64 with `-`/`_` swapped to
+   `+`/`/` - line 72 of `extractor.js`).
 3. `crypto.createDecipheriv('aes-256-gcm', Buffer.from(PEACHIFY_KEY_HEX, 'hex'), iv)`
-   then `.setAuthTag(authTag)` + `.update(ct)` + `.final()` → UTF-8 JSON.
-4. If `isEncrypted` is absent, the response is already plain JSON — returned as-is.
+   then `.setAuthTag(authTag)` + `.update(ct)` + `.final()` -> UTF-8 JSON.
+4. If `isEncrypted` is absent, the response is already plain JSON - returned as-is.
 
-**Vidnest (`new.vidnest.fun`) — custom-alphabet encoding.** No AES here; the
-payload is an obfuscated string decoded by a hand-rolled base64 variant
-(`vidnestDecode`, ~20 lines). Steps:
+**Vidnest - custom-alphabet encoding.** No AES here; the payload is an
+obfuscated string decoded by a hand-rolled base64 variant (`vidnestDecode`,
+~20 lines). Steps:
 
-1. Map each character through `VIDNEST_ALPHABET.indexOf(c)` → 6-bit values.
+1. Map each character through `VIDNEST_ALPHABET.indexOf(c)` -> 6-bit values.
 2. Re-pack 4 values into 3 bytes via bit-shifts (`a<<2 | b>>4`, etc.).
 3. A sentinel index of `64` marks padding/junk bytes and is skipped, so
    short/padded blocks decode cleanly.
-4. `Buffer.from(bytes).toString('utf8')` → one of three shapes (see §6.2).
+4. `Buffer.from(bytes).toString('utf8')` -> one of three shapes (see section 6.2).
 
 ### Dispatch & normalization
 
 `resolveStream(provider, type, id, season, episode)` is the single entry point:
-Peachify → `decryptPayload`, Vidnest → `vidnestDecode`. Both return JSON that
+Peachify -> `decryptPayload`, Vidnest -> `vidnestDecode`. Both return JSON that
 `toResult` / `vidnestToResult` flatten into the common
 `{ url, isM3U8, headers, referer, label }` contract. That single shape is what
-lets `/play` — and the frontend's "unknown host → proxy" rule — treat every
+lets `/play` - and the frontend "unknown host -> proxy" rule - treat every
 provider identically.
 
-### Why keys are NOT in this repo
+### Rotating the ciphers
 
-- **Attack surface:** a single leaked key lets anyone forge Peachify/Vidnest
-  requests at scale. Keeping them in env/secrets repo means a compromise is one
-  `rotate + redeploy` away, no code change.
-- **Rotation velocity:** upstreams rotate their ciphers frequently. The table in
-  §11 routes "encryption key / alphabet rotated" straight to the private repo —
-  this public tree never needs to move for cipher drift.
-
-> **Extraction recipe (for maintainers, not reproduced here):** the full
-> function-extraction + round-trip-verification workflow used to obtain the
-> AES key and alphabet is documented in the private secrets repo under
-> `/extractor/rotation.md`. Follow recipe §10 in this README first to find an
-> embed API, then re-derive the constants from the upstream JS bundle.
+Cipher drift is a deploy-time event, not a code change: swap the
+`PEACHIFY_KEY_HEX` / `VIDNEST_ALPHABET` env vars and restart (see section 11).
+The decoders themselves are agnostic to the constant's value, so rotating the
+key or alphabet never touches the pipeline logic - only the injected env var.
 
