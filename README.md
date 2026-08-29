@@ -32,6 +32,7 @@ proxied back to the browser.
 | **20× volume** | A simple HTML5 audio gain node sits behind the player slider — useful for quiet laptop speakers or noisy rooms. |
 | **Referer-gated CDN pass-through** | `/play` is a constant-memory range/Referer-rewriting reverse proxy, so even large files stream without buffering the whole file in RAM. |
 | **Open source & single-command** | One `docker compose up -d --build` spins up the entire stack on port 3000. |
+| **Extremely fast — zero buffering** | Server-side `Auto` mode races all healthy providers in parallel and plays whichever answers first; the segment cache in `/play` turns repeat/seek-back into near-instant hits (measured: 2.7 s → 0.22 s); warm API responses return in ~1 ms. |
 
 ```
   Browser ──(localhost only)──▶ Express server ──▶ Peachify / Vidnest / TMDB / subtitle APIs
@@ -173,8 +174,16 @@ npm start        # or: node server.js
 # → http://localhost:3000
 ```
 
-Optional env: `TMDB_API_KEY` (defaults to the public key embedded in
-`flixhq.js`), `PORT` (default 3000).
+Copy the template and fill in real values (see the **private secrets repo**
+for the actual cipher constants):
+
+```bash
+cp .env.example .env.local
+# → edit .env.local, fill TMDB_API_KEY, PEACHIFY_KEY_HEX, VIDNEST_ALPHABET
+```
+
+Optional overrides: `PORT` (default `3000`). `TMDB_API_KEY` falls back to the
+public read-only key embedded in `flixhq.js` if unset.
 
 Requires **ffmpeg on PATH** for HLS downloads (the Download button remuxes
 HLS → mp4). Direct `.mp4` sources download without it. Ubuntu:
