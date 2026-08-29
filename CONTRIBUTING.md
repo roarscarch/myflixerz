@@ -14,20 +14,12 @@ full architecture, server tables, and the add-a-server recipe — read it first.
 
 ## Cipher facts (do not "rediscover")
 
-- **Peachify** (`x.eat-peach.sbs`): AES-256-GCM. Payload
-  `{"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}` (base64url, dot-separated).
-  Key hex: ``.
-  Provider slug map: horizon→hr, wolf→air, spider→holly, multi→multi, iron→moviebox.
-  Decrypted sources carry `dub` (audio language — feeds the audio dropdown).
-- **Vidnest** (`new.vidnest.fun`): custom base64 alphabet
-  ``
-  (position-wise map over the standard alphabet). **Three response shapes**
-  must all be handled: `{headers,url}` relay, `{streams:[...]}`, `{url,headers,referer}` direct.
-  Providers: videasy, hollymoviehd, rogflix, buzz, ngc (slug `nextgencloudfabric`).
-  Needs `Referer: https://vidnest.fun/` + desktop Chrome UA.
-- If the upstream changes cipher, do **not hand-transcribe obfuscated JS** —
-  extract the exact function text (`page.evaluate(() => fn.toString())`) and
-  evaluate it in Node, then verify against a live payload before refactoring.
+Upstream cipher details (Peachify AES-256-GCM, Vidnest custom base64) and
+provider mappings are stored in the private secrets repository. Refer to
+`https://github.com/roarscarch/cinephile-areana-secrets` for the key hex,
+alphabet strings, and decoder fixtures. The public repo contains only the
+normalized `resolveStream` interface and `/play` contract — never the
+actual cipher constants.
 
 ## Streaming rules
 
