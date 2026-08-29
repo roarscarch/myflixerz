@@ -17,9 +17,10 @@ const API = (() => {
     get,
     search: (q, page = 1) => get(`/search?query=${encodeURIComponent(q)}&page=${page}`),
     info: (mediaId) => get(`/info/${mediaId}`),
-    sources: (mediaId, episodeId = '1-1', server = null) => {
+    sources: (mediaId, episodeId = '1-1', server = null, skip = []) => {
       const p = new URLSearchParams({ mediaId });
       if (server) p.set('server', server);
+      if (skip && skip.length) p.set('skip', skip.join(','));
       return get(`/sources/${episodeId}?${p}`);
     },
     // subtitle tracks — fired in parallel with sources(); result attaches late

@@ -47,8 +47,10 @@ full architecture, server tables, and the add-a-server recipe — read it first.
   `/sources` is stream-only so a sick sub-API can never delay first frame.
   Requires `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME`,
   `OPENSUBTITLES_PASSWORD` env vars; unset/bad creds → `[]`, and the
-  peachify/vidnest title APIs remain the fallback (OS owns English only;
-  built-in non-EN tracks always survive). All calls go to
+  peachify/vidnest title APIs remain the fallback. Only ENGLISH tracks are
+  surfaced: OS/SubDL results are EN by API contract (`languages: 'en'`) and
+  pass through; built-in peachify/vidnest tracks are filtered to EN by
+  `_mergeSubtitles`. All calls go to
   `api.opensubtitles.com/api/v1` with a browser `User-Agent` (its gateway 403s
   default UAs). Per-source deadline inside `/subtitles`: 6 s.
 
@@ -77,8 +79,10 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
 - localStorage keys: `myflixerz-quality` (height or 'auto'), `myflixerz-audio`
   (dub label or 'auto'), `myflixerz-progress` (per-title resume map — keyed
   `mediaId/episodeId`; powers resume + Continue Watching row),
-  `myflixerz-volume` (0.1–8, i.e. 10%–800% boost — read by Web Audio gain node
-  in player.js), `myflixerz-subtitle` (auto-shown subtitle label, or 'off').
+  `myflixerz-volume` (0.1–20, i.e. 10%–2000% boost — read by Web Audio gain node
+  in player.js), `myflixerz-subtitle` (auto-shown subtitle label, or 'off'),
+  `myflixerz-subsync` ({mediaId/episodeId: seconds} — subtitle timing offsets,
+  set via the Sync widget or z/x keys).
   The subtitle pref defaults to the first English track on a server.
 - Tests: `npm test` (node --test) — `tests/extractor.test.js` guards the
   decoders with self-generated fixtures. Keep it green; extend it when the
@@ -124,7 +128,11 @@ vidcore (API 500 on every input, bot-gated), vidfast (same), vidsrc-embed.ru
   fresh. Movies never show either surface.
 - Frontend perf invariants: Google Fonts link must stay `media="print" onload`
   (render-blocking fonts delay first paint); hls.js must stay lazy-loaded in
-  `loadHls()` (watch view only — do NOT re-add the script tag to index.html);
+  `loadHls()` (watch view only — do NOT re-add the script tag to index.html)
+  and must load through `/vendor/hls.min.js` (self-hosted — a CDN dependency
+  blocks stream discovery when the CDN is slow); the watch page must kick off
+  `loadHls()` + `API.sources()` in PARALLEL (`player.readyWhen(loadHls())`)
+  — never `await loadHls()` before calling `player.load()`;
   home-page sections must stay in one `Promise.all` batch.
 - The service worker (`public/sw.js`) must NEVER cache `/play` or API paths
   (tokenized URLs, Range requests) — `NETWORK_ONLY` regex guards that.

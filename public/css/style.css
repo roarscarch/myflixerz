@@ -633,6 +633,18 @@ button { font-family: inherit; }
 }
 .player-shell video { width: 100%; height: 100%; background: #000; }
 
+/* The custom Subtitles dropdown (+ Sync widget) is the app's ONLY subtitle
+   switcher. Chrome auto-shows its native CC button on <video controls> the
+   moment a text track is added via addTextTrack(), which duplicates the
+   control and can fight with our track management (mode showing/hidden, cue
+   re-rendering on sync). Hide it; Firefox never renders one, so this covers
+   every browser. */
+.player-shell video::-webkit-media-controls-toggle-closed-captions-button,
+.player-shell video::-webkit-media-controls-closed-captions-container {
+  display: none !important;
+}
+
+
 .player-loading {
   position: absolute;
   inset: 0;
@@ -710,6 +722,11 @@ button { font-family: inherit; }
   max-width: 280px;
 }
 .subs-select:disabled { opacity: 0.5; cursor: default; }
+
+/* subtitle sync widget: − / offset value / + next to the Subtitles dropdown */
+.subs-sync { display: inline-flex; align-items: center; gap: 4px; }
+.subs-sync .ctl-btn { padding: 9px 12px; min-width: 36px; }
+.subs-sync #subSyncVal { min-width: 92px; text-align: center; }
 
 .skip-intro {
   position: absolute;

@@ -25,6 +25,11 @@ function withDeadline(promise, ms) {
   return Promise.race([promise, cap]).finally(() => clearTimeout(t));
 }
 
+// Validation results are cached per URL so dead tracks only pay their timeout
+// once across sessions (they stay dead for the cache TTL, 10 min).
+const SUB_VALID_CACHE = new Map(); // url -> { ok: boolean, ts: number }
+const SUB_VALID_TTL = 10 * 60 * 1000;
+
 class FlixHQ {
   constructor() {
     this.name = 'MyFlixHQ';
@@ -228,12 +233,14 @@ class FlixHQ {
     return SERVERS.map((s) => ({ name: s.name }));
   }
 
-  async fetchEpisodeSources(episodeId, mediaId, server = null) {
+  async fetchEpisodeSources(episodeId, mediaId, server = null, skip = []) {
     // 60s TTL: server-button churn on the watch page is instant, while token
     // expiries are still too short for anything longer. resolveStream already
     // negative-caches dead providers, so a stale hit that 404s just falls
-    // through to the auto-cycle.
-    return this._cached(`sources:${episodeId}:${mediaId}:${server || 'auto'}`, 60 * 1000, () => this._episodeSources(episodeId, mediaId, server));
+    // through to the auto-cycle. `skip` (providers the client's fallback
+    // cascade already failed) is part of the cache key.
+    const sk = [...(skip || [])].sort().join(',');
+    return this._cached(`sources:${episodeId}:${mediaId}:${server || 'auto'}:${sk}`, 60 * 1000, () => this._episodeSources(episodeId, mediaId, server, skip));
   }
 
   // Shared mediaId/episodeId parsing for the sources and subtitles endpoints.
@@ -255,13 +262,14 @@ class FlixHQ {
     return { type, id, season, episode };
   }
 
-  // Merge OpenSubtitles-first English with the built-in family tracks, deduped.
+  // Merge English (SubDL/OpenSubtitles — English by API contract) with the
+  // built-in family tracks, deduped. ENGLISH-ONLY: built-in non-English tracks
+  // are dropped — the app only ever surfaces EN subs. OS/SubDL results pass
+  // through untouched since their labels are release names, not language names.
   _mergeSubtitles(osSubs, subs, vsubs) {
     const isEn = (s) => /english|\beng\b|\ben\b/i.test(`${s.label || ''} ${s.lang || ''}`);
-    const builtIn = [...subs, ...vsubs]; // peachify + vidnest title-level subs
-    const merged = osSubs.length
-      ? [...osSubs, ...builtIn.filter((s) => !isEn(s))] // OS owns EN; keep non-EN
-      : builtIn; // OS empty/unconfigured → existing family sources
+    const builtIn = [...subs, ...vsubs].filter(isEn); // drop non-EN family tracks
+    const merged = [...osSubs, ...builtIn];
     const seen = new Set();
     return merged.filter((s) => {
       const k = s.label || s.lang || 'unknown';
@@ -272,9 +280,39 @@ class FlixHQ {
   }
 
   /**
+   * Serve only VERIFIED-working subtitle tracks: fetch the head of each URL and
+   * keep tracks that answer with actual subtitle text (VTT header or SRT cue
+   * arrows). Dead hosts, expiring links, rate-limit responses and binary zips
+   * are dropped — the player's dropdown then only lists tracks that load.
+   * Runs on the /subtitles path only (never blocks playback).
+   */
+  async _validateSubtitles(subs) {
+    const SELF = `http://127.0.0.1:${process.env.PORT || 3000}`; // for local routes (/subtitles/subdl)
+    const check = async (s) => {
+      const cached = SUB_VALID_CACHE.get(s.url);
+      if (cached && Date.now() - cached.ts < SUB_VALID_TTL) return cached.ok ? s : null;
+      try {
+        const url = s.url.startsWith('/') ? SELF + s.url : s.url;
+        const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return null;
+        const head = (await r.text()).slice(0, 4000);
+        const ok = /^WEBVTT/m.test(head) || /-->/m.test(head); // subtitle text, not a zip/html/error
+        SUB_VALID_CACHE.set(s.url, { ok, ts: Date.now() });
+        return ok ? s : null;
+      } catch (e) {
+        SUB_VALID_CACHE.set(s.url, { ok: false, ts: Date.now() });
+        return null;
+      }
+    };
+    const results = await Promise.all(subs.slice(0, 8).map(check));
+    return results.filter(Boolean).slice(0, 6);
+  }
+
+  /**
    * Subtitle tracks ONLY. The browser fires this IN PARALLEL with playback and
    * attaches tracks whenever it lands — so unlike /sources there is no reason
    * to be stingy: generous-but-bounded budget, never blocking first frame.
+   * Every returned track is validated server-side first.
    */
   async fetchEpisodeSubtitles(episodeId, mediaId) {
     const { type, id, season, episode } = this._parseMedia(episodeId, mediaId);
@@ -285,17 +323,17 @@ class FlixHQ {
       withDeadline(fetchVidnestSubtitles(type, id, season, episode), budgetMs),
       imdbId ? withDeadline(fetchEnglishSubtitles({ type, imdbId, season, episode }), budgetMs) : [],
     ]);
-    return this._mergeSubtitles(osSubs, subs, vsubs);
+    return this._validateSubtitles(this._mergeSubtitles(osSubs, subs, vsubs));
   }
 
-  async _episodeSources(episodeId, mediaId, server = null) {
+  async _episodeSources(episodeId, mediaId, server = null, skip = []) {
     const { type, id, season, episode } = this._parseMedia(episodeId, mediaId);
 
     // FIRST FRAME IS THE ONLY CONTRACT ON THIS PATH. Zero subtitle work — not
     // even deadline-raced. Tracks are decoration the browser pulls separately
     // from GET /subtitles (fetchEpisodeSubtitles) and attaches after playback
     // starts, so even a fully dead subtitle API cannot delay one frame here.
-    const stream = await resolveStream({ type, id, season, episode, server });
+    const stream = await resolveStream({ type, id, season, episode, server, skip });
 
     const embedUrl = this._playerUrl(type, id, '', season, episode);
     return {

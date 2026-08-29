@@ -18,10 +18,22 @@
 // Other myflixerfree servers are dead upstream: vidsrc (Cloudflare 403),
 // vidify (522), vidcore/vidfast (API 500s + player is bot-gated; shared code).
 // Response time: ~1-2s per title (vs ~45s with a headless browser).
+// peachify (eat-peach):
+//   GET https://none.eat-peach.sbs/{provider}/{type}/{id}[/{season}/{episode}]
+//   -> { sources: [{url, dub, type, headers}], subtitles: [...] }   (plain JSON now)
+//   (Referer-gated: peachify.top / peachify.pro are allowed, others 403.)
+//
+// History: the old host x.eat-peach.sbs served {"isEncrypted":true,"data":
+// "{iv}.{ct}.{tag}"} (AES-256-GCM, key below) but now connection-blackholes.
+// The new host was decoded from peachify.pro's own player bundle (dF()/dO()):
+// same endpoint shape and same key, but responses are PLAIN JSON. Stream URLs
+// still point at the DEAD host's /m3u8-proxy?url=<real>&headers=<json> —
+// toResult() rewrites those into the real CDN URL so playback rides our /play
+// proxy with the embedded Origin/Referer headers.
 const crypto = require('crypto');
 const { httpClient } = require('../utils/http');
 
-const PEACHIFY_API = 'https://x.eat-peach.sbs';
+const PEACHIFY_API = 'https://none.eat-peach.sbs';
 const PEACHIFY_KEY_HEX = '';
 const PEACHIFY_REFERER = 'https://peachify.top/';
 
@@ -36,8 +48,9 @@ const PROVIDERS = [
 
 // vidnest's player bundles all fetch through new.vidnest.fun. Alphabet is a
 // reordered base64 from their bundle; `slug` overrides the API path segment
-// where it differs from the UI name. vidxyz/vidlink are omitted — they 502 on
-// every title we tried (dead upstream).
+// where it differs from the UI name. vidxyz returned to service (was 502 on
+// every title when first wired — re-probed 2026-08: working again, content-
+// gated per title like the rest). vidlink is still dead (502 HTML on every title).
 const VIDNEST_API = 'https://new.vidnest.fun';
 const VIDNEST_REFERER = 'https://vidnest.fun/';
 const VIDNEST_ALPHABET = '';
@@ -48,6 +61,7 @@ const VIDNEST_PROVIDERS = [
   { name: 'rogflix' },                     // akcloud.animanga.fun relay
   { name: 'buzz' },                        // direct m3u8 + expiring token
   { name: 'ngc', slug: 'nextgencloudfabric' },
+  { name: 'vidxyz' },                      // sparkvid workers relay (shape 2) — revived 2026-08
 ];
 
 const STREAM_UA =
@@ -296,7 +310,49 @@ async function fetchVidnestSubtitles(type, id, season, episode) {
   }
 }
 
+// Stream-startability probe: an embed API can answer fast with a source URL
+// whose CDN then 4xx/blackholes at play time (goodstream.cc is IP-blocked from
+// some networks while its API is the fastest responder). So before the race
+// awards a winner we fetch the source head server-side and only crown providers
+// whose stream is ACTUALLY playable. Passing results are cached so back-to-back
+// loads don't re-pay the master latency.
+const PROBE_STREAM_TIMEOUT_MS = 3000;
+const STREAM_OK_TTL_MS = 60_000;
+const streamOkCache = new Map(); // `${fam}:${provider}:${key}` -> expiry ms
+
+async function probeStreamPlayable(src) {
+  if (!src || !src.url) return false;
+  try {
+    const headers = { 'User-Agent': STREAM_UA };
+    if (src.referer) headers.Referer = src.referer;
+    if (src.origin) headers.Origin = src.origin;
+    const isM3U8 = src.isM3U8 || /\.m3u8($|\?)/i.test(src.url);
+    const res = await httpClient.get(src.url, {
+      headers,
+      timeout: PROBE_STREAM_TIMEOUT_MS,
+      maxRedirects: 4,
+      responseType: 'arraybuffer',
+      ...(isM3U8 ? {} : { headers: { ...headers, Range: 'bytes=0-0' } }),
+    });
+    if (!res || (res.status !== 200 && res.status !== 206)) return false;
+    if (isM3U8) {
+      const head = Buffer.from(res.data || []).toString('utf8', 0, 300);
+      return /#EXT/i.test(head) || String(res.headers['content-type'] || '').includes('mpegurl');
+    }
+    return (res.data && res.data.byteLength > 0); // mp4/mkv — any ranged bytes is playable
+  } catch (e) {
+    return false;
+  }
+}
+
 // ---- auto resolution: FIRST-WIN RACE ----
+// Every healthy provider from BOTH families is probed at once; the first one
+// to return a STARTABLE stream WINS. Each candidate's stream is verified via
+// probeStreamPlayable() before being crowned — a fast API whose CDN 4xxs at
+// play time never wins. Cold start therefore ≈ fastest healthy upstream, and
+// the winner the browser gets is a source that will actually play (no cascade
+// of dead-source fallbacks in the player). Dead-marks + family breaker run as
+// side effects, so bookkeeping stays correct even for probes still in flight.
 // Every healthy provider from BOTH families is probed at once; the first one
 // to return sources WINS immediately — we never wait for the losers. Cold
 // start therefore ≈ the fastest healthy upstream (~sub-second), not the 4s
@@ -347,14 +403,31 @@ async function autoRace(pOrder, vOrder, key, opts) {
           }
           return { ok: false };
         })
-        .then((r) => {
+        .then(async (r) => {
           left--;
           // Only the caller-VISIBLE winner records last-known-good: a probe
           // settling after someone else already won must not rewrite the
           // cache with a provider nobody actually played.
           if (r.ok && r.result.sources.length && !done) {
-            (fam === 'peachify' ? providerCache : vidnestCache).set(key, r.p.name);
-            finish({ won: true, result: r.result });
+            const scKey = `${r.fam}:${r.p.name}:${key}`;
+            let playable = (streamOkCache.get(scKey) || 0) > Date.now();
+            if (!playable) {
+              playable = await probeStreamPlayable(r.result.sources[0]);
+              if (playable) streamOkCache.set(scKey, Date.now() + STREAM_OK_TTL_MS);
+            }
+            if (playable) {
+              (r.fam === 'peachify' ? providerCache : vidnestCache).set(key, r.p.name);
+              finish({ won: true, result: r.result });
+            } else {
+              // API answered but the stream can't start — treat as dead, keep racing
+              markDead(r.fam, r.p, key);
+              fails[r.fam]++;
+              lastErr[r.fam] = `${r.p.name}: stream not startable`;
+              if (fails[r.fam] === totals[r.fam]) {
+                familyDeadUntil.set(r.fam, Date.now() + FAMILY_TTL_MS);
+              }
+              if (!left && !done) finish({ won: false, lastErr });
+            }
           } else if (!left && !done) {
             finish({ won: false, lastErr }); // every probe failed or was empty
           }
@@ -370,7 +443,7 @@ async function autoRace(pOrder, vOrder, key, opts) {
  * @returns {Promise<{provider, sources: [{url,quality,sizeBytes,isM3U8,headers?}],
  *                    subtitles: [...]}>}
  */
-async function resolveStream({ type, id, season, episode, server }) {
+async function resolveStream({ type, id, season, episode, server, skip }) {
   if (type !== 'movie' && type !== 'tv') throw new Error('type must be movie or tv');
   if (server) {
     const name = String(server).toLowerCase();
@@ -392,13 +465,14 @@ async function resolveStream({ type, id, season, episode, server }) {
   // familyDown gates keep a tripped breaker from launching probes at all.
   const key = titleKey(type, id, season, episode);
   const pc = providerCache.get(key);
+  const skipSet = new Set((skip || []).map((s) => String(s).toLowerCase()));
   const pOrder = (
     pc ? [pc, ...PROVIDERS.filter((p) => p.name !== pc.name)] : PROVIDERS
-  ).filter((p) => !familyDown('peachify') && !isDead('peachify', p, key));
+  ).filter((p) => !skipSet.has(p.name) && !familyDown('peachify') && !isDead('peachify', p, key));
   const vc = vidnestCache.get(key);
   const vOrder = (
     vc ? [vc, ...VIDNEST_PROVIDERS.filter((p) => p.name !== vc.name)] : VIDNEST_PROVIDERS
-  ).filter((p) => !familyDown('vidnest') && !isDead('vidnest', p, key));
+  ).filter((p) => !skipSet.has(p.name) && !familyDown('vidnest') && !isDead('vidnest', p, key));
 
   const out = await autoRace(pOrder, vOrder, key, { type, id, season, episode });
   if (out.won) return out.result;
@@ -408,16 +482,49 @@ async function resolveStream({ type, id, season, episode, server }) {
   throw new Error(`No source found on any provider (peachify: ${pe}; vidnest: ${ve})`);
 }
 
+// Embed providers wrap real streams in relay endpoints: Peachify uses
+//   {host}/m3u8-proxy?url=<real>&headers=<json>   and  {host}/mp4-proxy?url=<real>
+// (hosts vary: x.eat-peach.sbs, *.fastedge.app, …). Unwrap them: swap in the
+// real CDN URL and surface any embedded headers so playback can ride our /play
+// proxy with correct Origin/Referer — one less middleman hop per source.
+function unwrapProxies(src) {
+  if (!src || !src.url || !/\/(?:m3u8|mp4)-proxy/.test(src.url)) return src;
+  try {
+    const u = new URL(src.url);
+    const real = u.searchParams.get('url');
+    if (!real) return src;
+    let headers = null;
+    try {
+      const h = JSON.parse(u.searchParams.get('headers') || '{}');
+      headers = {
+        ...(h.origin ? { Origin: h.origin } : {}),
+        ...(h.referer ? { Referer: h.referer } : {}),
+      };
+    } catch (e) {}
+    return { ...src, url: real, headers };
+  } catch (e) {
+    return src;
+  }
+}
+
 function toResult(provider, data, type, id, season, episode) {
   const sources = (data.sources || [])
-    .map((s) => ({
-      url: s.url || s.src || s.file,
-      quality: s.quality || s.resolution || s.height || 'auto',
-      sizeBytes: s.sizeBytes || s.size || null,
-      dub: s.dub || null,
-      isM3U8: /\.m3u8($|\?)|m3u8-proxy/i.test(s.url || ''),
-      headers: s.headers || null,
-    }))
+    .map((s) => {
+      const unwrapped = unwrapProxies(s);
+      const h = unwrapped.headers || {};
+      const referer = h.Referer || h.referer || null;
+      const origin = h.Origin || h.origin || null;
+      return {
+        url: unwrapped.url || unwrapped.src || unwrapped.file,
+        quality: unwrapped.quality || unwrapped.resolution || unwrapped.height || 'auto',
+        sizeBytes: unwrapped.sizeBytes || unwrapped.size || null,
+        dub: unwrapped.dub || null,
+        isM3U8: /\.m3u8($|\?)|m3u8-proxy/i.test(unwrapped.url || ''),
+        headers: unwrapped.headers || null,
+        referer,
+        origin,
+      };
+    })
     .filter((s) => s.url);
 
   const subtitles = (data.subtitles || []).map((s) => ({

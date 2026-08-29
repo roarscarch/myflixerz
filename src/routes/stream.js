@@ -52,11 +52,28 @@ function cacheSegment(key, data, type) {
 const STREAM_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
+// Playlist cache: HLS master/variant playlists are small and mostly stable
+// (tokens renew hourly), so cache the REWRITTEN text per URL for a few minutes.
+// The startability probe + hls.js both fetch the same master — the second fetch
+// is served instantly, making "source selected → first frame" much faster.
+const PLAYLIST_CACHE = new Map(); // req.originalUrl -> { text, ts }
+const PLAYLIST_CACHE_TTL = 5 * 60 * 1000;
+const PLAYLIST_CACHE_MAX = 300;
+function getCachedPlaylist(key) {
+  const hit = PLAYLIST_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > PLAYLIST_CACHE_TTL) {
+    PLAYLIST_CACHE.delete(key);
+    return null;
+  }
+  return hit.text;
+}
+
 module.exports = function streamRoutes() {
   const router = Router();
 
   router.get('/play', async (req, res) => {
-    const { url, ref } = req.query;
+    const { url, ref, origin } = req.query;
     if (!url) return res.status(400).json({ error: 'url query parameter is required' });
     const referer = ref || 'https://peachify.top/';
     if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Invalid url' });
@@ -77,10 +94,23 @@ module.exports = function streamRoutes() {
         }
       }
 
+      // Cached rewritten playlist (master/variant) — serve BEFORE the upstream
+      // fetch so a repeat request never pays the CDN round-trip again.
+      const cachedPlaylist = getCachedPlaylist(req.originalUrl);
+      if (cachedPlaylist) {
+        return res.set({
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Access-Control-Allow-Origin': '*',
+        }).send(cachedPlaylist);
+      }
+
       const upstream = await fetch(url, {
         headers: {
           Referer: referer,
           'User-Agent': STREAM_UA,
+          // Some CDNs (peachify's nextgencloudfabric-backed streams) check the
+          // Origin header as well as Referer — pass it through when given.
+          ...(origin ? { Origin: origin } : {}),
           ...(range ? { Range: range } : {}),
         },
       });
@@ -102,7 +132,10 @@ module.exports = function streamRoutes() {
         const toPlay = (u) => {
           try {
             const abs = new URL(u, url).href;
-            return `/play?ref=${encodeURIComponent(referer)}&url=${encodeURIComponent(abs)}`;
+            const params = new URLSearchParams({ ref: referer });
+            if (origin) params.set('origin', origin);
+            params.set('url', abs);
+            return `/play?${params.toString()}`;
           } catch (e) {
             return null;
           }
@@ -124,6 +157,12 @@ module.exports = function streamRoutes() {
             return toPlay(t) || line;
           })
           .join('\n');
+        // bound the cache
+        if (PLAYLIST_CACHE.size >= PLAYLIST_CACHE_MAX) {
+          const oldest = PLAYLIST_CACHE.keys().next().value;
+          if (oldest) PLAYLIST_CACHE.delete(oldest);
+        }
+        PLAYLIST_CACHE.set(req.originalUrl, { text: rewritten, ts: Date.now() });
         res.send(rewritten);
       } else {
         // mp4 / segments / subtitles: stream through (piped, constant memory)

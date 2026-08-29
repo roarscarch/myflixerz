@@ -1,28 +1,54 @@
 // Video player: hls.js playback, subtitle tracks, server switching, skip-intro.
 const Player = (() => {
-  // CORS-open hosts play directly; everything else goes through /play.
-  // When every source on a server dies mid-playback, advance through the server
-  // list automatically (vidnest first — its API is the most reliable right now).
-  const SERVER_FALLBACK_ORDER = ['videasy', 'hollymoviehd', 'rogflix', 'buzz', 'ngc', 'horizon', 'wolf', 'spider', 'multi', 'iron'];
-  const PROXY_HOSTS = ['eat-peach.sbs', '97bf1.com', 'cache.vdrk.site'];
+  // CORS-open hosts play directly in the browser (verified probing for
+  // Access-Control-Allow-Origin + no Referer/Origin gating); everything else
+  // goes through /play. When every source on a server dies mid-playback,
+  // advance through the server list automatically (vidnest first — its API is
+  // the most reliable right now).
+  const CORS_OPEN_HOSTS = [
+    'eat-peach.sbs',             // (legacy)
+    '97bf1.com',                 // buzz
+    'cache.vdrk.site',           // vidnest subtitles
+    'sparkvid.workers.dev',      // vidxyz
+    'remoteconsultinggroup.site' // wolf/ngc — ACAO: *, plays headerless
+  ];
   const PROVIDER_LABELS = {
     horizon: 'Horizon', wolf: 'Wolf', spider: 'Spider', multi: 'Multi', iron: 'Iron',
-    videasy: 'Videasy', hollymoviehd: 'HollyMovie', rogflix: 'Rogflix', buzz: 'Buzz', ngc: 'NGC',
+    videasy: 'Videasy', hollymoviehd: 'HollyMovie', rogflix: 'Rogflix', buzz: 'Buzz', ngc: 'NGC', vidxyz: 'VidXYZ',
   };
 
-  function isDirect(url) {
+  // Fallback race budget per title load. Each failed provider is added to a
+  // skip list and the remainder is re-raced — every attempt is a FRESH server,
+  // so we converge on a working one (or a clear error) instead of looping.
+  const MAX_RACE_ATTEMPTS = 8;
+
+  // Direct CDN URLs on CORS-open hosts play browser-direct (no /play hop);
+  // so do progressive MP4s with their own sign-token auth (a <video src>
+  // element has no CORS constraints and can't be Referer-gated by us anyway —
+  // if the source demands headers we must proxy). Everything else rides /play.
+  function isDirect(url, src) {
     try {
-      return PROXY_HOSTS.some((h) => new URL(url).hostname.endsWith(h));
+      const u = new URL(url);
+      if (CORS_OPEN_HOSTS.some((h) => u.hostname.endsWith(h))) return true;
+      if (src && !src.isM3U8 && !src.referer && !src.origin && /\.(mp4|mkv|webm|m4v)($|\?)/i.test(u.pathname + u.search)) return true;
     } catch (e) {
       return false;
     }
+    return false;
   }
 
-  // Direct CDN URLs need our /play proxy (referer + CORS); CORS-open hosts play
+  // Direct CDNs need our /play proxy (referer + CORS); CORS-open hosts play
   // direct. Some vidnest sources carry their own referer (goodstream etc.) —
   // pass it through so the CDN doesn't reject the segment requests.
-  function playableUrl(url, referer) {
-    return isDirect(url) ? url : `/play?ref=${encodeURIComponent(referer || 'https://peachify.top/')}&url=${encodeURIComponent(url)}`;
+  function playableUrl(url, referer, origin, src) {
+    // Local API routes (e.g. /subtitles/subdl?zip=…) are same-origin — fetch
+    // them directly. /play only proxies absolute http(s) URLs and would 400.
+    if (url.startsWith('/')) return url;
+    if (isDirect(url, src)) return url;
+    const params = new URLSearchParams({ ref: referer || 'https://peachify.top/' });
+    if (origin) params.set('origin', origin);
+    params.set('url', url);
+    return `/play?${params.toString()}`;
   }
 
   function pickBest(sources) {
@@ -95,13 +121,29 @@ const Player = (() => {
       this._upNextShown = false;
       // Volume boost beyond 100% (Web Audio). video.volume is capped at 1.0, so
       // once the gain graph is live we hold video.volume=1 and let a GainNode
-      // own loudness (up to 800%). A DynamicsCompressor (near-limiter) clamps
+      // own loudness (up to 2000%). A DynamicsCompressor (near-limiter) clamps
       // boosted peaks so we don't clip — that's what the ✓ boost experiment does.
-      this._volume = Math.min(8, Math.max(0.1, Number(localStorage.getItem('myflixerz-volume') || '1')));
+      this._volume = Math.min(20, Math.max(0.1, Number(localStorage.getItem('myflixerz-volume') || '1')));
       this._audioGraph = null; // AudioContext
       this._audioGain = null; // GainNode (dangerously owns loudness > 1)
       this._subtitle = null; // {url,label} — feeds the Download button
+      // Subtitle sync state: _subBaseCues holds the RAW cue times from the
+      // subtitle file; _subOffset (seconds) and _subScale (fps correction) are
+      // applied at add-time so tweaks re-render instantly without refetching.
+      this._subBaseCues = null;
+      this._subOffset = 0;
+      this._subScale = 1;
+      this._subAutoDone = false; // auto fps-guess runs once per loaded track
+      this._failedSubs = new Set(); // subtitle URLs that errored — never re-picked
       this.video.volume = this._volume > 1 ? 1 : Math.max(0, Math.min(1, this._volume));
+      // fps auto-resync needs video.duration — retry when metadata lands
+      this.video.addEventListener('loadedmetadata', () => this._maybeAutoSync());
+      // a stream that genuinely starts playing means the session is healthy —
+      // reset the fallback budget so a real mid-play death can re-race later
+      this.video.addEventListener('playing', () => {
+        this._racedProviders = new Set();
+        this._raceAttempts = 0;
+      });
 
       this.video.addEventListener('timeupdate', () => {
         this._checkIntro();
@@ -167,8 +209,24 @@ const Player = (() => {
             this.changeSpeed(-0.25);
             e.preventDefault();
             break;
+          case 'z': // subtitle sync: 0.1s earlier
+            this.setSubtitleOffset((this._subOffset || 0) - 0.1);
+            e.preventDefault();
+            break;
+          case 'x': // subtitle sync: 0.1s later
+            this.setSubtitleOffset((this._subOffset || 0) + 0.1);
+            e.preventDefault();
+            break;
         }
       });
+    }
+
+    /**
+     * Route wires the hls.js script promise here so the player can hold it and
+     * finish attaching only once the stream AND the player library are ready.
+     */
+    readyWhen(hlsPromise) {
+      this._hlsReady = Promise.resolve(hlsPromise).catch(() => {});
     }
 
     load({ mediaId, episodeId = '1-1', title, server = null, image = '' }) {
@@ -179,13 +237,21 @@ const Player = (() => {
       this._image = image;
       this.quality = localStorage.getItem('myflixerz-quality') || 'auto';
       this.audio = localStorage.getItem('myflixerz-audio') || 'auto';
-      this._triedServers = null;
+      this._racedProviders = new Set(); // servers already raced & failed — skipped on re-race
+      this._raceAttempts = 0; // bounded fallback budget per title (no infinite re-racing)
       this._intro = null;
       this._introFired = false;
       this._started = false;
       this._lastSave = 0;
       this._upNextShown = false; // fresh episode → pre-end window re-arms
       this.resumePos = 0;
+      // subtitle sync resets per title/episode (each release syncs differently);
+      // the watch view re-applies the stored per-title offset right after load()
+      this._subBaseCues = null;
+      this._subOffset = 0;
+      this._subScale = 1;
+      this._subAutoDone = false;
+      this._failedSubs = new Set(); // fresh title → forget past subtitle failures
       // where we left off on THIS title+episode (resume on first successful attach)
       try {
         const map = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
@@ -196,7 +262,10 @@ const Player = (() => {
       this._pendingResume = this.resumePos > RESUME_MIN;
       this.showLoading('Finding streams…');
       API.sources(mediaId, episodeId, server)
-        .then((res) => {
+        .then(async (res) => {
+          // the hls.js script loads in parallel with this sources fetch —
+          // by the time streams arrive it's almost always already on the page
+          if (this._hlsReady) await this._hlsReady;
           this.sources = res.sources || [];
           this.provider = res.provider;
           // NOTE: no subtitle work here — /sources is stream-only by contract.
@@ -211,7 +280,7 @@ const Player = (() => {
     }
 
     _play() {
-      if (!this.sources.length) return this.showError('No playable sources found.');
+      if (!this.sources.length) return this._autoAdvance(this.provider); // empty server → race the rest
       this._started = true;
       // respect the stored audio choice (dub) when this server carries it
       let src = null;
@@ -276,9 +345,9 @@ const Player = (() => {
       }
     }
 
-    /** Set volume in [0.1, 8] (10%–800%). 1 = 100%, 2 = 200%, 4 = 400%, 8 = 800%. */
+    /** Set volume in [0.1, 20] (10%–2000%). 1 = 100%, 2 = 200%, 4 = 400%, 20 = 2000%. */
     setVolume(v) {
-      this._volume = Math.max(0.1, Math.min(8, Number(v) || 0.1));
+      this._volume = Math.max(0.1, Math.min(20, Number(v) || 0.1));
       localStorage.setItem('myflixerz-volume', String(this._volume));
       if (this._audioGain) {
         this.video.volume = 1;
@@ -296,7 +365,9 @@ const Player = (() => {
 
     _attach(src) {
       this._currentSource = src;
-      const url = playableUrl(src.url, src.referer);
+      this._attachId = (this._attachId || 0) + 1;
+      const attachId = this._attachId; // stale handlers from older attaches are ignored
+      const url = playableUrl(src.url, src.referer, src.origin);
       this.hideLoading();
 
       // mid-playback re-attach (server switch, dead source, audio/quality
@@ -367,6 +438,7 @@ const Player = (() => {
           this.video.play().catch(() => {});
         });
         this.hls.on(Hls.Events.ERROR, (ev, data) => {
+          if (attachId !== this._attachId) return; // ignore stale attach errors
           if (data.fatal) {
             this.hls.destroy();
             this.hls = null;
@@ -376,7 +448,9 @@ const Player = (() => {
       } else {
         this.video.src = url;
         this.video.play().catch(() => {});
-        this.video.addEventListener('error', () => this._fallbackNext(), { once: true });
+        this.video.addEventListener('error', () => {
+          if (attachId === this._attachId) this._fallbackNext();
+        }, { once: true });
         // no manifest — quality menu comes from the source labels instead
         const qs = [...new Set((this.sources || []).map((s) => s.quality).filter((q) => q && q !== 'auto'))];
         this._emitQuality(qs);
@@ -392,7 +466,7 @@ const Player = (() => {
         this.showLoading('Source failed — trying another…');
         this._attach(this.sources[this.currentIndex]);
       } else {
-        this._autoAdvance();
+        this._autoAdvance(this.provider);
       }
     }
 
@@ -492,29 +566,44 @@ const Player = (() => {
       }
     }
 
-    // All streams on the current server died — move to the next server with a
-    // visible notice (each server re-resolves its own sources). Bounded by
-    // _triedServers so we never loop forever.
-    _autoAdvance() {
-      this.showLoading(`Server ${PROVIDER_LABELS[this.server] || this.server || '?'} failed — trying next…`);
-      if (!this._triedServers) this._triedServers = new Set(this.server ? [this.server] : []);
-      const idx = SERVER_FALLBACK_ORDER.indexOf(this.server);
-      for (let i = idx === -1 ? 0 : idx + 1; i < SERVER_FALLBACK_ORDER.length; i++) {
-        const next = SERVER_FALLBACK_ORDER[i];
-        if (this._triedServers.has(next)) continue;
-        this._triedServers.add(next);
-        this.switchServer(next);
-        return;
+    /**
+     * A server failed — NEVER hang on the error. Re-race the REMAINING servers
+     * (failed ones are skipped server-side) so we converge on a working server
+     * instead of re-picking the same broken one forever. Bounded by
+     * _raceAttempts: if every available provider has been raced and failed,
+     * that's a real outage and worth an actual error message.
+     */
+    _autoAdvance(failedProvider) {
+      if (!this._racedProviders) this._racedProviders = new Set();
+      if (failedProvider) this._racedProviders.add(failedProvider);
+      if (this._raceAttempts >= MAX_RACE_ATTEMPTS) {
+        return this.showError('All servers failed. Try again later.');
       }
-      this.showError('All servers failed. Try another server.');
+      this._raceAttempts += 1;
+      const skip = [...this._racedProviders];
+      const who = PROVIDER_LABELS[this.provider || this.server] || this.provider || this.server || 'a server';
+      this.showLoading(
+        skip.length
+          ? `${who} failed — trying the next available server…`
+          : 'Racing all servers — playing the fastest…'
+      );
+      this.switchServer(null, skip);
     }
 
-    async switchServer(name) {
+    async switchServer(name, skip = []) {
       this.server = name;
       this.currentIndex = 0;
-      this.showLoading(`Connecting to ${PROVIDER_LABELS[name] || name}…`);
+      this.showLoading(
+        name
+          ? `Connecting to ${PROVIDER_LABELS[name] || name}…`
+          : skip.length
+          ? 'Racing remaining servers — playing the fastest…'
+          : 'Racing all servers — playing the fastest…'
+      );
       try {
-        const res = await API.sources(this.mediaId, this.episodeId, name);
+        const res = await API.sources(this.mediaId, this.episodeId, name, skip);
+        // hls.js loads in parallel with this fetch; attach only when it's ready
+        if (this._hlsReady) await this._hlsReady;
         this.sources = res.sources || [];
         this.provider = res.provider; // subtitle list is title-level & already loaded
         this.shell.dispatchEvent(
@@ -522,7 +611,8 @@ const Player = (() => {
         );
         this._play();
       } catch (e) {
-        this.showError(e.message);
+        // never surface the raw error while other servers may exist
+        this._autoAdvance(name || this.provider);
       }
     }
 
@@ -559,6 +649,8 @@ const Player = (() => {
         if (cues) for (let i = cues.length - 1; i >= 0; i--) cues.remove(cues[i]);
       });
       this._subTrack = null;
+      this._subBaseCues = null; // new file → fresh raw cues, reset the fps guess
+      this._subScale = 1;
       if (!url) {
         [...(this.video.textTracks || [])].forEach((t) => (t.mode = 'hidden'));
         return;
@@ -573,18 +665,70 @@ const Player = (() => {
       // won't show" actually display.
       const src = this._currentSource || (this.sources && this.sources[0]);
       const ref = src && src.referer;
-      fetch(playableUrl(url, ref))
+      fetch(playableUrl(url, ref, src && src.origin))
         .then((r) => (r.ok ? r.text() : Promise.reject(new Error('subtitle fetch failed'))))
         .then((text) => {
           const vtt = isSrt(url) ? srtToVtt(text) : text;
-          parseVtt(vtt).forEach((c) => track.addCue(c));
+          // stash the RAW cue times — offset/scale are applied in _addSubCues
+          // so sync tweaks re-render instantly without refetching the file
+          this._subBaseCues = parseVtt(vtt).map((c) => ({ start: c.startTime, end: c.endTime, text: c.text }));
+          this._addSubCues(track);
+          this._maybeAutoSync();
           [...(this.video.textTracks || [])].forEach((t) => (t !== track ? (t.mode = 'hidden') : null));
           track.mode = 'showing';
         })
         .catch((e) => {
           console.warn('subtitle:', e.message);
+          this._failedSubs.add(url); // never auto-pick this track again
           this.shell.dispatchEvent(new CustomEvent('subtitle-error', { detail: { label: label || '' } }));
         });
+    }
+
+    /** Re-render the active track's cues with the current offset + fps scale. */
+    _addSubCues(track) {
+      if (!track || !this._subBaseCues) return;
+      if (track.cues) for (let i = track.cues.length - 1; i >= 0; i--) track.cues[i].remove();
+      const off = this._subOffset || 0;
+      const scale = this._subScale || 1;
+      for (const c of this._subBaseCues) {
+        try {
+          track.addCue(new VTTCue(Math.max(0, c.start * scale + off), Math.max(0.05, c.end * scale + off), c.text));
+        } catch (e) {}
+      }
+    }
+
+    /**
+     * AUTO fps resync (runs once per loaded track). Subs timed for a different
+     * framerate drift — e.g. a 23.976fps-timed SRT on a 25fps PAL stream makes
+     * the video run 4.17% short, so cues overshoot increasingly. If
+     * (last cue end / video duration) matches a known fps ratio within 1.5%,
+     * rescale all cue times. Subs that end EARLY are normal (credits), so we
+     * only ever act when they overshoot.
+     */
+    _maybeAutoSync() {
+      if (this._subAutoDone || !this._subBaseCues || !this._subBaseCues.length) return;
+      const d = this.video.duration;
+      if (!Number.isFinite(d) || d < 600) return; // need a real runtime to judge
+      const last = this._subBaseCues[this._subBaseCues.length - 1].end;
+      if (!(last > d)) return;
+      const ratio = last / d;
+      const KNOWN = [25 / 23.976, 24 / 23.976, 25 / 24, 29.97 / 23.976, 30 / 23.976, 50 / 23.976];
+      const hit = KNOWN.find((r) => Math.abs(ratio - r) / r < 0.015);
+      if (!hit) return;
+      this._subScale = 1 / hit;
+      this._subAutoDone = true;
+      this._addSubCues(this._subTrack);
+    }
+
+    /**
+     * Shift subtitle timing by `sec` seconds (+ = subs show later). Re-renders
+     * the active track instantly; emits 'subtitle-sync' so the watch view can
+     * update the UI and persist per title+episode.
+     */
+    setSubtitleOffset(sec) {
+      this._subOffset = Math.round((Number(sec) || 0) * 10) / 10; // 0.1s resolution
+      this._addSubCues(this._subTrack);
+      this.shell.dispatchEvent(new CustomEvent('subtitle-sync', { detail: { offset: this._subOffset } }));
     }
 
     /** True if a subtitle on this server is (or contains) English. */
@@ -600,7 +744,8 @@ const Player = (() => {
      *  - otherwise the first English subtitle, else the first one
      */
     autoSubtitle() {
-      const subs = this.subtitles || [];
+      // skip tracks that already failed to load this session — never re-pick one
+      const subs = (this.subtitles || []).filter((s) => !(this._failedSubs && this._failedSubs.has(s.url)));
       if (!subs.length) return null;
       const pref = localStorage.getItem('myflixerz-subtitle') || '';
       if (pref === 'off') return null;

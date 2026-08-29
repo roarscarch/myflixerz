@@ -26,14 +26,15 @@
   }
 
   // hls.js (~400KB) loads only when a watch page opens; browse/search pages
-  // never pay for it. Cached by the service worker after first use.
+  // never pay for it. Self-hosted (public/vendor) so it never depends on a
+  // third-party CDN — served by our own Express + cached by the service worker.
   let hlsPromise = null;
   function loadHls() {
     if (window.Hls) return Promise.resolve();
     if (!hlsPromise) {
       hlsPromise = new Promise((resolve, reject) => {
         const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js';
+        s.src = '/vendor/hls.min.js';
         s.onload = () => resolve();
         s.onerror = () => {
           hlsPromise = null; // allow retry
@@ -560,13 +561,18 @@
           <select class="subs-select" id="subsSelect">
             <option value="">Subtitles: Off</option>
           </select>
+          <span class="subs-sync" id="subSync" hidden>
+            <button class="subs-select ctl-btn" id="subSyncMinus" title="Subtitles earlier (shortcut: z)">−</button>
+            <button class="subs-select ctl-btn" id="subSyncVal" title="Subtitle sync — click to reset (shortcuts: z / x)">Sync: 0.0s</button>
+            <button class="subs-select ctl-btn" id="subSyncPlus" title="Subtitles later (shortcut: x)">+</button>
+          </span>
           <button class="subs-select ctl-btn" id="speedBtn" title="Playback speed (shortcuts: > / <)">Speed: 1x</button>
           <button class="subs-select ctl-btn" id="pipBtn" title="Picture in picture">⧉ PiP</button>
           <button class="subs-select ctl-btn" id="downloadBtn" title="Download this video">↓ Download</button>
           <span class="vol-wrap">
             <button class="subs-select ctl-btn" id="volBtn" title="Volume (shortcuts: ↑ / ↓)">🔊 100%</button>
             <div class="vol-pop" id="volPop" hidden>
-              <input id="volRange" type="range" min="10" max="800" value="100" step="5" />
+              <input id="volRange" type="range" min="10" max="2000" value="100" step="5" />
               <span id="volLabel">100%</span>
             </div>
           </span>
@@ -593,10 +599,12 @@
       );
     } catch (e) {}
 
-    // player (hls.js lazy-loaded — only the watch page needs it)
-    await loadHls().catch(() => {});
+    // player — created immediately, no awaiting. The hls.js download starts
+    // NOW in parallel with the sources fetch (both run concurrently instead of
+    // serial), so the CDN/self-host script never delays stream discovery.
     const shell = view.querySelector('.player-shell');
     const player = new Player.MoviePlayer(shell);
+    player.readyWhen(loadHls().catch(() => {}));
     const subsSelect = view.querySelector('#subsSelect');
 
     // toolbar: speed + PiP + download + resume notice
@@ -624,7 +632,7 @@
       toastMsg('Download started — check your Downloads folder.');
     });
     // volume boost (>100% via Web Audio gain). Button shows the live %, popup
-    // has a 10–400% slider; the player routes through gain+limiter.
+    // has a 10–2000% slider; the player routes through gain+limiter.
     const volBtn = view.querySelector('#volBtn');
     const volPop = view.querySelector('#volPop');
     const volRange = view.querySelector('#volRange');
@@ -670,6 +678,11 @@
     shell.addEventListener('sources-ready', (e) => {
       const labels = Player.PROVIDER_LABELS;
       const p = e.detail.provider;
+      // sync the server buttons to whoever actually won (auto races and
+      // fallbacks may land on a server the user never clicked)
+      bar.querySelectorAll('.server-btn').forEach((x) =>
+        x.classList.toggle('active', x.dataset.server === (p || ''))
+      );
       const n = (player.subtitles || []).length;
       document.getElementById('providerInfo').textContent =
         p ? `Server: ${labels[p] || p}${n ? ` · ${n} subtitle${n === 1 ? '' : 's'}` : ''}` : '';
@@ -682,7 +695,43 @@
       player.loadSubtitle(sub ? sub.url : '', sub ? sub.label : '');
       localStorage.setItem('myflixerz-subtitle', sub ? sub.label : 'off'); // Off = remember "no subs"
     });
-    shell.addEventListener('subtitle-error', (e) => toastMsg(`Subtitle failed to load${e.detail.label ? ': ' + e.detail.label : ''} `));
+    shell.addEventListener('subtitle-error', (e) => {
+      // auto-recover: the dead track is now blacklisted in the player, so
+      // re-running autoSubtitle picks the NEXT English track (null when out)
+      toastMsg(`Subtitle failed to load${e.detail.label ? ': ' + e.detail.label : ''} — trying the next one…`);
+      const next = player.autoSubtitle();
+      if (next) player.loadSubtitle(next.url, next.label);
+    });
+    // ---- subtitle sync widget: per title+episode timing offset. ±0.5s buttons
+    // here, ±0.1s fine-tune via z/x keys, click the value to reset. Offset is
+    // re-applied instantly from the stashed raw cues (no refetch) and persisted
+    // under 'myflixerz-subsync'. The player also auto-corrects fps mismatches.
+    const SUB_SYNC_KEY = 'myflixerz-subsync';
+    const syncBox = view.querySelector('#subSync');
+    const syncVal = view.querySelector('#subSyncVal');
+    const syncKey = `${mediaId}/${episodeId}`;
+    let storedSync = 0;
+    try {
+      storedSync = Number((JSON.parse(localStorage.getItem(SUB_SYNC_KEY) || '{}')[syncKey])) || 0;
+    } catch (e) {}
+    const showSync = (off) => {
+      syncBox.hidden = (player.subtitles || []).length === 0;
+      syncVal.textContent = `Sync: ${off > 0 ? '+' : ''}${Number(off).toFixed(1)}s`;
+    };
+    shell.addEventListener('subtitle-sync', (e) => {
+      showSync(e.detail.offset);
+      try {
+        const map = JSON.parse(localStorage.getItem(SUB_SYNC_KEY) || '{}');
+        if (e.detail.offset) map[syncKey] = e.detail.offset;
+        else delete map[syncKey];
+        localStorage.setItem(SUB_SYNC_KEY, JSON.stringify(map));
+      } catch (err) {}
+    });
+    shell.addEventListener('subtitles-ready', () => showSync(player._subOffset || 0));
+    view.querySelector('#subSyncMinus').onclick = () => player.setSubtitleOffset((player._subOffset || 0) - 0.5);
+    view.querySelector('#subSyncPlus').onclick = () => player.setSubtitleOffset((player._subOffset || 0) + 0.5);
+    syncVal.onclick = () => player.setSubtitleOffset(0);
+    player.setSubtitleOffset(storedSync); // re-apply the saved offset for this title
     // audio dropdown — lists every dub across the dub-capable servers, not just
     // the current one. Picking a language that lives on another server switches
     // to it automatically. Resolution-suffixed labels (English-Hindi-1080p)

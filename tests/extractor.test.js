@@ -112,3 +112,29 @@ test('peachify: toResult keeps dub/quality, skips url-less sources', () => {
   assert.strictEqual(r.sources[0].quality, '1080p');
   assert.strictEqual(r.sources[0].isM3U8, false);
 });
+
+test('peachify: toResult unwraps dead m3u8-proxy into real CDN url + headers', () => {
+  const real = 'https://remoteconsultinggroup.site/Y7Q4/pl/master.m3u8';
+  const proxy =
+    'https://x.eat-peach.sbs/m3u8-proxy?url=' +
+    encodeURIComponent(real) +
+    '&headers=' +
+    encodeURIComponent(JSON.stringify({ origin: 'https://nextgencloudfabric.com', referer: 'https://nextgencloudfabric.com/' }));
+  const r = toResult({ name: 'wolf' }, { sources: [{ url: proxy, dub: 'English', type: 'hls' }] });
+  assert.strictEqual(r.sources.length, 1);
+  assert.strictEqual(r.sources[0].url, real);
+  assert.strictEqual(r.sources[0].isM3U8, true);
+  assert.strictEqual(r.sources[0].origin, 'https://nextgencloudfabric.com');
+  assert.strictEqual(r.sources[0].referer, 'https://nextgencloudfabric.com/');
+  assert.strictEqual(r.sources[0].dub, 'English');
+});
+
+test('peachify: toResult unwraps mp4-proxy (any host) into real CDN url', () => {
+  const real = 'https://bcdnxw.hakunaymatata.com/convert-h264/302da107.mp4?sign=23dd6af3&t=1788022';
+  const proxy = 'https://twist-range-1049499.fastedge.app/mp4-proxy?url=' + encodeURIComponent(real);
+  const r = toResult({ name: 'iron' }, { sources: [{ url: proxy, dub: 'English', type: 'mp4' }] });
+  assert.strictEqual(r.sources.length, 1);
+  assert.strictEqual(r.sources[0].url, real);
+  assert.strictEqual(r.sources[0].isM3U8, false);
+  assert.strictEqual(r.sources[0].referer, null); // no headers param → no header gating
+});

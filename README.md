@@ -224,10 +224,19 @@ labels; the slug after the host is what the API expects.
 | `multi` | `multi` | has Tamil/Telugu/Hindi dubs |
 | `iron` | `moviebox` | has Hindi/French/Russian/Spanish etc. |
 
-**Request:** `GET https://x.eat-peach.sbs/{slug}/{movie|tv}/{id}[/{s}/{e}]`
+**Request:** `GET https://none.eat-peach.sbs/{slug}/{movie|tv}/{id}[/{s}/{e}]`
+(referer-gated: `Referer: https://peachify.top/` required, else 403).
 
-**Response payload:** `{"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}` where the
-three parts are base64url (no padding) and separated by `.`.
+> **2026-08 migration:** the old host `x.eat-peach.sbs` connection-blackholes.
+> The new host was decoded from peachify.pro's own player bundle (`dF()`/`dO()`):
+> same endpoint shape and AES key, but responses are now **plain JSON** (the
+> `isEncrypted` wrapper is gone, though `toResult` still handles both). Stream
+> URLs still wrap the real CDN in `x.eat-peach.sbs/m3u8-proxy?url=<real>&headers=<json>`
+> — `toResult()` unwraps those into the real URL + `{Origin, Referer}` headers so
+> playback rides our `/play` proxy (which now forwards the `origin` query param).
+
+**Legacy response payload (old host):** `{"isEncrypted":true,"data":"{iv}.{ct}.{tag}"}`
+where the three parts are base64url (no padding) and separated by `.`.
 
 **Decryption:** AES-256-GCM, key hex:
 ```
@@ -339,14 +348,14 @@ new hosts default to the proxy, which is the safe choice.
 | Feature | How it works |
 |---|---|
 | Server buttons | `GET /servers/...` lists the 10 names; "Auto" (default) lets the backend pick. Clicking a server reloads sources for it only. |
-| Auto-fallback | `player.js` keeps `_triedServers`; if a server fails mid-play it auto-advances in `SERVER_FALLBACK_ORDER = ['videasy','hollymoviehd','rogflix','buzz','ngc','horizon','wolf','spider','multi','iron']`, bounded by the tried list. Each failure shows a visible "Server X failed — trying next…" notice (no more silent black screens). |
+| Auto-fallback | First load and every failure race ALL healthy servers in parallel server-side (`resolveStream` auto mode) and play whichever answers first with sources. A failing/empty server never surfaces an error — the player silently re-races (`Server X failed — playing the fastest available…`); a real error is shown only when every server is dead. Server buttons auto-highlight the provider that actually won. |
 | Quality | hls.js levels (`hls.levels` / `hls.currentLevel` by height). Stored as **`myflixerz-quality`** in localStorage (`'auto'` = ABR, or an explicit height). Non-HLS (MP4) sources re-attach with the chosen source. |
 | Audio (dub) | Dropdown is always visible. `collectDubs()` reads the current server's `dub` values, then probes `GET /dubs` once (which checks iron + multi) and merges. Picking a language the current server lacks **auto-switches the server button** to the one that has it. Stored as **`myflixerz-audio`**. |
 | Subtitles | Merged from both subtitle APIs, deduped by label, populated on demand from the sources payload. VTT/SRT both parse. |
 | Resume + Continue Watching | Position saved to **`myflixerz-progress`** (per `mediaId/episodeId`, throttled to 5s, removed when the title ends). On reload the player seeks back automatically ("Resumed from 1:30" toast); the home page shows a "⏯️ Continue Watching" row with per-title progress bars, jumping straight into the right episode. |
-| Keyboard shortcuts | `space`/`k` play-pause · `→`/`l` +10s · `←`/`j` −10s · `↑`/`↓` volume · `m` mute · `f` fullscreen · `>`/`.` speed up · `<`/`,` speed down (ignored while typing). |
+| Keyboard shortcuts | `space`/`k` play-pause · `→`/`l` +10s · `←`/`j` −10s · `↑`/`↓` volume · `m` mute · `f` fullscreen · `>`/`.` speed up · `<`/`,` speed down · `z`/`x` subtitle −/+0.1s (ignored while typing). |
 | Speed + PiP | Toolbar buttons: speed cycles 0.25× increments (clamped 0.25–2×), PiP button hidden when unsupported. |
-| First paint | Google Fonts load **async** (never block first paint — fallback text shows instantly, `display=swap` swaps in the font); hls.js (~400 KB) is **lazy-loaded only on watch pages** (browse/search never parse it); home-page rows fetch **in parallel** (was 4 sequential round-trips; now one batch — full home renders in ~130 ms warm). |
+| First paint | Google Fonts load **async** (never block first paint); hls.js (~400 KB) lazy-loaded only on watch pages + self-hosted at `/vendor/hls.min.js` (no CDN); the hls.js download and the `API.sources()` stream race run **in parallel** (`player.readyWhen(loadHls())`); **every provider's stream is startability-verified server-side** before the race crowns a winner — a fast API whose CDN 4xxs at play time (e.g. goodstream) never wins, so the player gets a source that actually starts (no dead-source cascade); `/play` caches rewritten playlists (5 min) so repeat loads kick off in **milliseconds**. |
 | Download | Toolbar button saves whatever is currently playing. Direct sources stream through `/download` with an `attachment` header; HLS gets remuxed to `.mp4` by server-side ffmpeg (`-c:v copy`, no re-encode). Filename comes from the title. Requires ffmpeg on PATH for HLS. |
 | Skip intro | `api.theintrodb.org` lookup. |
 

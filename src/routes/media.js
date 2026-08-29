@@ -49,14 +49,15 @@ module.exports = function mediaRoutes(tmdb) {
   router.get('/sources/:episodeId', async (req, res) => {
     try {
       const { episodeId } = req.params;
-      const { mediaId, server } = req.query;
+      const { mediaId, server, skip } = req.query;
       if (!mediaId) {
         return res.status(400).json({ error: 'mediaId query parameter is required' });
       }
       if (!episodeId) {
         return res.status(400).json({ error: 'Episode ID is required' });
       }
-      const sources = await tmdb.fetchEpisodeSources(episodeId, mediaId, server);
+      const skipList = skip ? String(skip).split(',').map((s) => s.trim()).filter(Boolean) : [];
+      const sources = await tmdb.fetchEpisodeSources(episodeId, mediaId, server, skipList);
       if (!sources) {
         return res.status(404).json({ error: 'Sources not found' });
       }
