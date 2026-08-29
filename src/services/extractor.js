@@ -34,7 +34,8 @@ const crypto = require('crypto');
 const { httpClient } = require('../utils/http');
 
 const PEACHIFY_API = 'https://none.eat-peach.sbs';
-const PEACHIFY_KEY_HEX = '';
+const PEACHIFY_KEY_HEX = process.env.PEACHIFY_KEY_HEX;
+if (!PEACHIFY_KEY_HEX) throw new Error("PEACHIFY_KEY_HEX env required (see private secrets repo)");
 const PEACHIFY_REFERER = 'https://peachify.top/';
 
 // Provider order mirrors the site's own player auto-cycling.
@@ -53,7 +54,8 @@ const PROVIDERS = [
 // gated per title like the rest). vidlink is still dead (502 HTML on every title).
 const VIDNEST_API = 'https://new.vidnest.fun';
 const VIDNEST_REFERER = 'https://vidnest.fun/';
-const VIDNEST_ALPHABET = '';
+const VIDNEST_ALPHABET = process.env.VIDNEST_ALPHABET;
+if (!VIDNEST_ALPHABET) throw new Error("VIDNEST_ALPHABET env required (see private secrets repo)");
 
 const VIDNEST_PROVIDERS = [
   { name: 'videasy' },                     // tiktoks.animanga.fun relay — movie + tv
