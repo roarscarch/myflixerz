@@ -1,5 +1,7 @@
 node_modules/
-screenshots/
+# ignore everything in screenshots except the images used in the README
+screenshots/*
+!screenshots/*.png
 *.log
 .env
 .DS_Store
