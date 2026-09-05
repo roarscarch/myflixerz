@@ -4,6 +4,8 @@
 
 ## Watch Any Movie — Free, Forever.
 
+**Watch it live: [https://cinephilia-vercel.vercel.app](https://cinephilia-vercel.vercel.app) — Click here and let me know how it was!**
+
 **Pure, uninterrupted cinema. No ads. No login. No interruptions. Just you and the movie.**
 
 </div>
@@ -35,6 +37,13 @@
 1. **Open the app** in your browser (or run it on your own machine — see the tech guide below).
 2. **Search** for anything you want to watch.
 3. **Press play.** That's it. Enjoy the movie.
+
+---
+
+## Feedback & Bugs
+
+- **Tried it? [Click here](https://cinephilia-vercel.vercel.app) and let me know how it was!**
+- Found a bug or something not working? [Create an issue](https://github.com/roarscarch/cinephile-areana/issues/new) and I'll fix it.
 
 ---
 
